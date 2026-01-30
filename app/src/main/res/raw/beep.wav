@@ -1,0 +1,3 @@
+MediaPlayer mp = MediaPlayer.create(this, R.raw.beep);
+mp.setOnCompletionListener(MediaPlayer::release);
+mp.start();

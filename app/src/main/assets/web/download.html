@@ -1,0 +1,76 @@
+<!-- app/src/main/assets/web/download.html -->
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Downloading model</title>
+    <style>
+        body { font-family: Arial, Helvetica, sans-serif; background: #fff; color:#222; margin:0; display:flex; align-items:center; justify-content:center; height:100vh; }
+        .card { width: 90%; max-width:420px; padding:22px; border-radius:12px; box-shadow: 0 6px 22px rgba(0,0,0,0.08); text-align:center; }
+        h1 { margin: 0 0 8px; font-size:20px; }
+        p { margin: 6px 0 18px; color:#555; }
+        .progress-wrap { width:100%; background:#eee; border-radius:8px; overflow:hidden; height:18px; }
+        .progress { height:100%; width:0%; background: linear-gradient(90deg,#4caf50,#2e7d32); transition: width 150ms linear; }
+        .meta { margin-top:12px; font-size:13px; color:#666; }
+        .btn { margin-top:16px; display:inline-block; padding:10px 16px; border-radius:8px; background:#1976d2; color:#fff; text-decoration:none; cursor:pointer; border:none; }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h1>Downloading AI model</h1>
+    <p>This app downloads the model the first time to keep the APK small.</p>
+
+    <div class="progress-wrap">
+        <div id="progressBar" class="progress"></div>
+    </div>
+
+    <div class="meta">
+        <span id="percent">0%</span> • <span id="downloaded">0 / 0 MB</span>
+    </div>
+
+    <button id="retryBtn" class="btn" style="display:none">Retry</button>
+</div>
+
+<script>
+    // Called from Android: updateProgress(loadedBytes, totalBytes)
+    window.updateProgress = function(loaded, total) {
+      var pct = 0;
+      if (total > 0) pct = Math.round((loaded / total) * 100);
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('percent').innerText = pct + '%';
+
+      // display MB nicely
+      function toMB(b) { return (b/1024/1024).toFixed(2); }
+      document.getElementById('downloaded').innerText = toMB(loaded) + ' / ' + toMB(total) + ' MB';
+    };
+
+    // Called from Android when finished to switch to main index.html
+    window.downloadComplete = function() {
+      // Give a small visual confirmation then tell Android to load main
+      document.getElementById('percent').innerText = '100%';
+      document.getElementById('progressBar').style.width = '100%';
+      setTimeout(function(){
+        // Ask Android to load the main UI
+        if (window.AndroidBridge && window.AndroidBridge.onDownloadComplete) {
+          window.AndroidBridge.onDownloadComplete();
+        }
+      }, 300);
+    };
+
+    // Called from Android when an error occurs
+    window.downloadFailed = function(msg) {
+      document.getElementById('retryBtn').style.display = 'inline-block';
+      document.getElementById('retryBtn').onclick = function() {
+          if (window.AndroidBridge && window.AndroidBridge.retryDownload) {
+              window.AndroidBridge.retryDownload();
+          }
+      };
+      alert('Download failed: ' + (msg || 'unknown error'));
+    };
+
+    // show initial state (0)
+    updateProgress(0, 0);
+</script>
+</body>
+</html>
