@@ -30,7 +30,7 @@
 
         <!-- ===== MAIN ACTIVITY ===== -->
         <activity
-            android:name=".MainActivity"
+            android:name="com.example.offlineai.MainActivity"
             android:exported="true"
             android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
@@ -42,7 +42,7 @@
 
         <!-- ===== WAKE WORD FOREGROUND SERVICE ===== -->
         <service
-            android:name=".WakeWordService"
+            android:name="com.example.offlineai.WakeWordService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
 

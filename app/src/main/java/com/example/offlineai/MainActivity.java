@@ -56,7 +56,7 @@
     import java.util.concurrent.atomic.AtomicBoolean;
 
 
-    public class MainActivity extends AppCompatActivity {
+    public class MainActivity extends AppCompatActivity implements LicenseManager.LicenseCallback {
 
         private static final String TAG = "OfflineAI";
         private static final int PERM_REQUEST_MIC = 777;
@@ -64,6 +64,11 @@
 
         private static final String DEFAULT_LLM_URL = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task";
         private static final String WHISPER_MODEL_URL = "https://model12323.s3.ap-south-1.amazonaws.com/whisper-base.en.tflite";
+
+        // License enforcement
+        private LicenseManager licenseManager;
+        private volatile boolean licenseValid = false;
+        private volatile boolean licenseCheckInProgress = false;
 
         private WebView web;
         private TextToSpeech tts;
@@ -942,15 +947,8 @@
             // Initialize Bluetooth audio if permissions granted
             bluetoothAudioManager.initialize();
 
-            // Continue with existing initialization
-            llmManager = new GoogleLlmManager();
-            File modelFile = new File(getExternalFilesDir(null), "model.task");
-            if (modelFile.exists() && modelFile.length() > 1000000) {
-                new Thread(() -> initLlm(modelFile.getAbsolutePath())).start();
-            } else {
-                new Thread(() -> downloadModelAndInit(DEFAULT_LLM_URL)).start();
-            }
-
+            // Continue with existing initialization - LLM init is handled by enforceLicenseAndInitLLM()
+            // Only initialize Whisper here (STT doesn't require license)
             new Thread(() -> {
                 copyAssetFlat("models/filters_vocab_en.bin", "filters_vocab_en.bin");
                 File whisperModel = new File(dataDir, "whisper-base.en.tflite");
@@ -987,6 +985,9 @@
             // Initialize Bluetooth audio manager
             bluetoothAudioManager = new BluetoothAudioManager(this);
 
+            // Initialize license manager FIRST
+            licenseManager = new LicenseManager(this);
+            licenseManager.setCallback(this);
 
             setupWebView();
             setupTTS();
@@ -995,13 +996,10 @@
             } else {
                 requestMicPermission(); // For backward compatibility
             }
-            llmManager = new GoogleLlmManager();
-            File modelFile = new File(getExternalFilesDir(null), "model.task");
-            if (modelFile.exists() && modelFile.length() > 1000000) {
-                new Thread(() -> initLlm(modelFile.getAbsolutePath())).start();
-            } else {
-                new Thread(() -> downloadModelAndInit(DEFAULT_LLM_URL)).start();
-            }
+
+            // Enforce license check before LLM initialization
+            llmManager = new GoogleLlmManager(this);
+            enforceLicenseAndInitLLM();
 
             new Thread(() -> {
                 copyAssetFlat("models/filters_vocab_en.bin", "filters_vocab_en.bin");
@@ -1012,11 +1010,173 @@
             }).start();
         }
 
+        /* ===================== LICENSE ENFORCEMENT ===================== */
+
+        /**
+         * Enforce license check and initialize LLM only if valid
+         */
+        private void enforceLicenseAndInitLLM() {
+            Log.i(TAG, "Enforcing license check before LLM init...");
+
+            // Check if we need online revalidation
+            if (licenseManager.needsOnlineRevalidation()) {
+                Log.w(TAG, "Online revalidation required");
+                licenseValid = false;
+                licenseCheckInProgress = true;
+
+                // Notify UI that license check is needed
+                ui.post(() -> {
+                    notifyLicenseStatus(false, "Online validation required. Please connect to internet.");
+                });
+                return;
+            }
+
+            // Perform local license enforcement
+            if (licenseManager.enforceLicenseCheck()) {
+                licenseValid = true;
+                Log.i(TAG, "License valid - initializing LLM");
+                initializeLLMIfLicensed();
+            } else {
+                licenseValid = false;
+                Log.w(TAG, "License invalid - blocking LLM");
+                ui.post(() -> {
+                    notifyLicenseStatus(false, "Subscription required. Please renew.");
+                });
+            }
+        }
+
+        /**
+         * Initialize LLM only if license is valid
+         */
+        private void initializeLLMIfLicensed() {
+            if (!licenseValid) {
+                Log.w(TAG, "Cannot initialize LLM - license invalid");
+                return;
+            }
+
+            File modelFile = new File(getExternalFilesDir(null), "model.task");
+            if (modelFile.exists() && modelFile.length() > 1000000) {
+                new Thread(() -> initLlm(modelFile.getAbsolutePath())).start();
+            } else {
+                new Thread(() -> downloadModelAndInit(DEFAULT_LLM_URL)).start();
+            }
+        }
+
+        /**
+         * Validate license with email - called from UI
+         */
+        public void validateLicenseWithEmail(String email) {
+            Log.i(TAG, "Validating license for: " + email);
+            licenseCheckInProgress = true;
+            licenseManager.validateLicenseFromServer(email);
+        }
+
+        /**
+         * Notify JS about license status
+         */
+        private void notifyLicenseStatus(boolean valid, String message) {
+            String jsCall = String.format(
+                "if(window.onLicenseStatus) window.onLicenseStatus(%b, '%s')",
+                valid, message.replace("'", "\\'")
+            );
+            web.evaluateJavascript(jsCall, null);
+        }
+
+        // LicenseManager.LicenseCallback implementation
+        @Override
+        public void onLicenseValid() {
+            Log.i(TAG, "License callback: VALID");
+            licenseValid = true;
+            licenseCheckInProgress = false;
+
+            ui.post(() -> {
+                notifyLicenseStatus(true, "License valid");
+                initializeLLMIfLicensed();
+            });
+        }
+
+        @Override
+        public void onLicenseInvalid(String reason) {
+            Log.w(TAG, "License callback: INVALID - " + reason);
+            licenseValid = false;
+            licenseCheckInProgress = false;
+
+            ui.post(() -> {
+                notifyLicenseStatus(false, reason);
+            });
+        }
+
+        @Override
+        public void onLicenseCheckInProgress() {
+            Log.i(TAG, "License callback: CHECK IN PROGRESS");
+            licenseCheckInProgress = true;
+
+            ui.post(() -> {
+                notifyLicenseStatus(false, "Validating license...");
+            });
+        }
+
+        @Override
+        public void onNetworkRequired() {
+            Log.w(TAG, "License callback: NETWORK REQUIRED");
+            licenseValid = false;
+            licenseCheckInProgress = false;
+
+            ui.post(() -> {
+                notifyLicenseStatus(false, "Please connect to internet to validate license.");
+            });
+        }
+
+        @Override
+        public void onLicenseExpired() {
+            Log.w(TAG, "License callback: LICENSE EXPIRED - auto-blocking access");
+            licenseValid = false;
+            licenseCheckInProgress = false;
+            llmReady = false;
+
+            ui.post(() -> {
+                // Stop any active call/conversation
+                if (callActive) {
+                    callActive = false;
+                    safeStopTTS();
+                    resetConversationState();
+                }
+
+                // End study mode if active
+                if (studyModeActive) {
+                    endStudyMode();
+                }
+
+                // Notify UI via JavaScript
+                notifyLicenseStatus(false, "Your subscription has expired. Please renew to continue.");
+                notifyStatus(); // Update LLM ready status
+
+                // Call specific JS callback for expiry
+                web.evaluateJavascript("if(window.onLicenseExpired) window.onLicenseExpired()", null);
+
+                // Show toast
+                Toast.makeText(MainActivity.this, "Subscription expired. Please renew.", Toast.LENGTH_LONG).show();
+            });
+        }
+
+        /**
+         * Check if license allows LLM operations
+         */
+        public boolean isLicenseValidForLLM() {
+            return licenseValid && licenseManager != null && licenseManager.isLicenseValid();
+        }
 
         // 🔥 FIXED: Updated wake receiver to allow commands during conversation
         private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
+                // Block wake if license invalid
+                if (!licenseValid) {
+                    Log.w(TAG, "Wake blocked - license invalid");
+                    speak("Subscription required. Please renew to use voice features.");
+                    return;
+                }
+
                 if (studyModeActive && responsePaused) {
                     Log.i(TAG, "🚫 Ignoring broadcast command while paused");
                     return;
@@ -1050,6 +1210,24 @@
             super.onResume();
             Log.i(TAG, "onResume called");
 
+            // Start license expiry monitoring
+            if (licenseManager != null) {
+                licenseManager.startExpiryMonitoring();
+
+                // Check if license expired while app was in background
+                if (licenseManager.isLicenseExpiredNow()) {
+                    Log.w(TAG, "License expired while app was in background");
+                    licenseValid = false;
+                    ui.post(() -> notifyLicenseStatus(false, "Your subscription has expired. Please renew."));
+                }
+                // Re-check license on resume (enforce 3-day validation)
+                else if (licenseManager.needsOnlineRevalidation()) {
+                    Log.w(TAG, "License revalidation needed on resume");
+                    licenseValid = false;
+                    ui.post(() -> notifyLicenseStatus(false, "Please validate your license."));
+                }
+            }
+
             IntentFilter filter = new IntentFilter(WakeWordService.ACTION_WAKE);
             IntentFilter cmdFilter = new IntentFilter(WakeWordService.ACTION_COMMAND);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1064,6 +1242,12 @@
         @Override
         protected void onPause() {
             Log.i(TAG, "onPause called");
+
+            // Stop license expiry monitoring when app goes to background
+            if (licenseManager != null) {
+                licenseManager.stopExpiryMonitoring();
+            }
+
             try { unregisterReceiver(wakeReceiver); } catch (Exception ignored) {}
             try { unregisterReceiver(commandReceiver); } catch (Exception ignored) {}
             super.onPause();
@@ -1299,6 +1483,107 @@
             public boolean isModelDownloaded() {
                 File f = new File(getExternalFilesDir(null), "model.task");
                 return f.exists() && f.length() > 1000000;
+            }
+
+            /* ===================== LICENSE MANAGEMENT JS BRIDGE ===================== */
+
+            @JavascriptInterface
+            public boolean isLicenseValid() {
+                return licenseValid && licenseManager != null && licenseManager.isLicenseValid();
+            }
+
+            @JavascriptInterface
+            public void validateLicense(String email) {
+                Log.i(TAG, "JS requested license validation for: " + email);
+                ui.post(() -> validateLicenseWithEmail(email));
+            }
+
+            @JavascriptInterface
+            public String getDeviceId() {
+                if (licenseManager != null) {
+                    return licenseManager.getDeviceId();
+                }
+                return "";
+            }
+
+            @JavascriptInterface
+            public String getLicenseEmail() {
+                if (licenseManager != null) {
+                    return licenseManager.getUserEmail() != null ? licenseManager.getUserEmail() : "";
+                }
+                return "";
+            }
+
+            @JavascriptInterface
+            public long getLicenseExpiryTime() {
+                if (licenseManager != null) {
+                    return licenseManager.getLicenseExpiryTime();
+                }
+                return 0;
+            }
+
+            @JavascriptInterface
+            public long getRemainingLicenseTime() {
+                if (licenseManager != null) {
+                    return licenseManager.getRemainingLicenseTime();
+                }
+                return 0;
+            }
+
+            @JavascriptInterface
+            public long getRemainingOfflineTime() {
+                if (licenseManager != null) {
+                    return licenseManager.getRemainingOfflineTime();
+                }
+                return 0;
+            }
+
+            @JavascriptInterface
+            public boolean needsOnlineValidation() {
+                if (licenseManager != null) {
+                    return licenseManager.needsOnlineRevalidation();
+                }
+                return true;
+            }
+
+            @JavascriptInterface
+            public void clearLicense() {
+                Log.i(TAG, "JS requested license clear (logout)");
+                ui.post(() -> {
+                    if (licenseManager != null) {
+                        licenseManager.clearLicenseData();
+                        licenseValid = false;
+                        llmReady = false;
+                        notifyStatus();
+                        // Don't show any message - let the auth screen handle it
+                    }
+                });
+            }
+
+            @JavascriptInterface
+            public void setLicenseEmail(String email) {
+                Log.i(TAG, "JS setting license email: " + email);
+                if (licenseManager != null) {
+                    licenseManager.setUserEmail(email);
+                }
+            }
+
+            @JavascriptInterface
+            public String getLicenseStatus() {
+                try {
+                    JSONObject status = new JSONObject();
+                    status.put("valid", licenseValid);
+                    status.put("deviceId", licenseManager != null ? licenseManager.getDeviceId() : "");
+                    status.put("email", licenseManager != null && licenseManager.getUserEmail() != null ? licenseManager.getUserEmail() : "");
+                    status.put("expiryTime", licenseManager != null ? licenseManager.getLicenseExpiryTime() : 0);
+                    status.put("remainingLicenseTime", licenseManager != null ? licenseManager.getRemainingLicenseTime() : 0);
+                    status.put("remainingOfflineTime", licenseManager != null ? licenseManager.getRemainingOfflineTime() : 0);
+                    status.put("needsOnlineValidation", licenseManager != null ? licenseManager.needsOnlineRevalidation() : true);
+                    return status.toString();
+                } catch (Exception e) {
+                    Log.e(TAG, "Error getting license status", e);
+                    return "{}";
+                }
             }
 
             @JavascriptInterface
@@ -3162,8 +3447,21 @@
         public static class GoogleLlmManager {
             private LlmInference engine;
             private LlmInferenceSession session;
+            private Context appContext;
+            private LicenseManager licenseManager;
+
+            public GoogleLlmManager(Context context) {
+                this.appContext = context.getApplicationContext();
+                this.licenseManager = new LicenseManager(context);
+            }
 
             public boolean init(Context ctx, String path) {
+                // 🔒 LICENSE CHECK: Block initialization if license invalid
+                if (licenseManager != null && !licenseManager.enforceLicenseCheck()) {
+                    Log.e("LLM_INIT", "Init blocked - license invalid");
+                    return false;
+                }
+
                 try {
                     LlmInference.LlmInferenceOptions opts = LlmInference.LlmInferenceOptions
                             .builder()
@@ -3179,6 +3477,12 @@
             }
 
             public String generate(String prompt) {
+                // 🔒 LICENSE CHECK: Block generation if license invalid
+                if (licenseManager != null && !licenseManager.enforceLicenseCheck()) {
+                    Log.e("LLM_GEN", "Generation blocked - license invalid");
+                    return "Your subscription has expired. Please renew to continue using this feature.";
+                }
+
                 if (prompt == null || prompt.isEmpty()) {
                     return "Please provide a question.";
                 }

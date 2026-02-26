@@ -9,6 +9,112 @@ let currentUser = {
   plan: { name: "Pro", expiresAt: "2099-01-01" }
 };
 
+/* ================= LICENSE STATE ================= */
+let licenseValid = false;
+let licenseEmail = "";
+let licenseDeviceId = "";
+let licenseExpiryTime = 0;
+
+// License status callback from Android
+window.onLicenseStatus = function(valid, message) {
+  console.log("License status:", valid, message);
+  licenseValid = valid;
+
+  // Update auth screen license status - minimal text only
+  const licenseStatusEl = document.getElementById("authLicenseStatus");
+  if (licenseStatusEl) {
+    licenseStatusEl.style.display = "block";
+    licenseStatusEl.textContent = valid ? "✓ License valid" : message || "License required";
+    licenseStatusEl.style.color = valid ? "#4CAF50" : "#f44336";
+  }
+
+  if (valid) {
+    hideLicenseScreen();
+    updateLicenseUI(true, message);
+  } else {
+    updateLicenseUI(false, message);
+  }
+};
+
+function updateLicenseUI(valid, message) {
+  const statusEl = document.getElementById("license-status");
+  if (statusEl) {
+    statusEl.textContent = message || (valid ? "License Valid" : "License Required");
+    statusEl.className = valid ? "license-valid" : "license-invalid";
+  }
+
+  // Disable/enable controls based on license
+  const startBtn = document.getElementById("start-call-btn");
+  const studyBtn = document.getElementById("start-study-btn");
+
+  if (startBtn) startBtn.disabled = !valid;
+  if (studyBtn) studyBtn.disabled = !valid;
+}
+
+function showLicenseScreen(message) {
+  // DEPRECATED: Use auth screen instead
+  // Just show auth screen with license message
+  showAuth();
+  const licenseStatusEl = document.getElementById("authLicenseStatus");
+  if (licenseStatusEl && message) {
+    licenseStatusEl.style.display = "block";
+    licenseStatusEl.textContent = message;
+    licenseStatusEl.style.color = "#f44336";
+  }
+}
+
+function hideLicenseScreen() {
+  // No longer needed - handled by auth screen
+}
+
+function validateLicenseFromUI() {
+  // DEPRECATED: Use sendOTPAndValidate instead
+  const emailInput = document.getElementById("license-email-input") || document.getElementById("authEmail");
+  const email = emailInput ? emailInput.value.trim() : "";
+
+  if (!email || !email.includes("@")) {
+    alert("Please enter a valid email address.");
+    return;
+  }
+
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.validateLicense) {
+    AndroidBridge.validateLicense(email);
+  }
+}
+
+function checkLicenseOnStartup() {
+  // Don't show separate license screen - auth screen handles everything
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.isLicenseValid) {
+    licenseValid = AndroidBridge.isLicenseValid();
+    // License status will be shown on auth screen if needed
+  }
+}
+
+// Called when license auto-expires while app is running
+window.onLicenseExpired = function() {
+  console.log("LICENSE EXPIRED - auto-blocking access");
+  licenseValid = false;
+
+  // End any active call
+  if (callActive) {
+    callActive = false;
+    stopFreeTimer();
+    updateCallButton();
+  }
+
+  // Show auth screen with expiry message
+  showAuth();
+  const licenseStatusEl = document.getElementById("authLicenseStatus");
+  if (licenseStatusEl) {
+    licenseStatusEl.style.display = "block";
+    licenseStatusEl.textContent = "Your subscription has expired. Please renew.";
+    licenseStatusEl.style.color = "#f44336";
+  }
+
+  // Update UI elements
+  updateLicenseUI(false, "Subscription expired");
+};
+
 /* ================= STUDY MODE STATE ================= */
 
 let studySegments = [];
@@ -182,6 +288,17 @@ function toggleAutoPauseSubSettings(show) {
 function showAuth() {
   document.getElementById("authScreen").style.display = "flex";
   document.getElementById("mainApp").style.display = "none";
+
+  // Check if user is already logged in to show logout options
+  const savedEmail = localStorage.getItem("userEmail");
+  if (savedEmail) {
+    document.getElementById("authLoggedEmail").textContent = savedEmail;
+    document.getElementById("loggedInActions").style.display = "block";
+    document.getElementById("emailStep").style.display = "none";
+  } else {
+    document.getElementById("loggedInActions").style.display = "none";
+    document.getElementById("emailStep").style.display = "block";
+  }
 }
 
 function showMainApp() {
@@ -189,10 +306,12 @@ function showMainApp() {
   document.getElementById("mainApp").style.display = "block";
 }
 
-async function sendOTP() {
+// Combined: Send OTP + Validate License
+async function sendOTPAndValidate() {
   const email = document.getElementById("authEmail").value.trim();
   const error = document.getElementById("authError");
   const loader = document.getElementById("authLoader");
+  const licenseStatus = document.getElementById("authLicenseStatus");
 
   if (!email || !email.includes("@")) {
     error.innerText = "Please enter a valid email";
@@ -201,6 +320,16 @@ async function sendOTP() {
 
   error.innerText = "";
   loader.style.display = "block";
+  if (licenseStatus) {
+    licenseStatus.style.display = "block";
+    licenseStatus.textContent = "Validating license...";
+    licenseStatus.style.color = "#aaa";
+  }
+
+  // Trigger license validation via Android bridge
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.validateLicense) {
+    AndroidBridge.validateLicense(email);
+  }
 
   try {
     const res = await fetch(`${API_BASE}/api/send-otp`, {
@@ -221,6 +350,11 @@ async function sendOTP() {
   } finally {
     loader.style.display = "none";
   }
+}
+
+// Keep original sendOTP for backward compatibility
+async function sendOTP() {
+  return sendOTPAndValidate();
 }
 
 function showOTPStep() {
@@ -342,6 +476,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadFreeTime();
   loadSettings();
   loadStudyData();
+
+  // Check license status on startup
+  checkLicenseOnStartup();
 
   const cachedUser = localStorage.getItem("userProfile");
   const token = localStorage.getItem("authToken");
@@ -746,6 +883,27 @@ function closePanels() {
 }
 
 function logout() {
+  logoutWithReset();
+}
+
+// Logout: reset device on backend + clear local data
+async function logoutWithReset() {
+  const email = localStorage.getItem("userEmail");
+
+  // Try to reset device on backend (ignore errors - just best effort)
+  if (email) {
+    try {
+      await fetch(`${API_BASE}/api/reset-device`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email })
+      });
+    } catch (e) {
+      // Ignore - logout anyway
+    }
+  }
+
+  // Clear local data
   callActive = false;
   window.AndroidBridge?.endCall?.();
 
@@ -766,7 +924,23 @@ function logout() {
     localStorage.setItem("studySegments", studyData);
   }
 
+  // Clear license data via Android bridge
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.clearLicense) {
+    AndroidBridge.clearLicense();
+  }
+
+  licenseValid = false;
   showAuth();
+}
+
+// Keep for backward compatibility
+function logoutFull() {
+  logoutWithReset();
+}
+
+// Keep for backward compatibility
+async function resetDeviceAndLogout() {
+  logoutWithReset();
 }
 
 function downloadModel() {
@@ -847,6 +1021,14 @@ function formatPlanExpiry(expiresAt) {
 
 /* ================= CALL AI ================= */
 function toggleCall() {
+  // 🔒 LICENSE CHECK: Block if license invalid
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.isLicenseValid) {
+    if (!AndroidBridge.isLicenseValid()) {
+      showLicenseScreen("Your subscription has expired. Please renew to use voice features.");
+      return;
+    }
+  }
+
   loadFreeTime();
 
   if (isFreeUser() && freeLimitLocked) {
