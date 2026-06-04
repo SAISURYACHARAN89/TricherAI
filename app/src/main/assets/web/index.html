@@ -315,6 +315,7 @@
     <div class="tab-buttons">
         <button class="tab-btn active" onclick="showStudyTab('segments')">Segments</button>
         <button class="tab-btn" onclick="showStudyTab('notes')">Notes</button>
+        <button class="tab-btn" onclick="showStudyTab('docs')">Documents</button>
     </div>
 
     <div id="segmentsTab" class="study-tab">
@@ -342,6 +343,33 @@
         <div class="study-section">
             <h4>All Notes</h4>
             <div id="allNotesList"></div>
+        </div>
+    </div>
+
+    <div id="docsTab" class="study-tab" style="display: none;">
+        <div class="study-section">
+            <div class="segment-header">
+                <h4>Documents (RAG)</h4>
+                <button id="uploadPdfBtn" class="add-btn" onclick="uploadPdf()">+ Upload File</button>
+            </div>
+
+            <div id="pdfStatus" style="font-size: 12px; color: #888; margin-top: 10px;">
+                Upload TXT files to help the AI answer questions about them.
+            </div>
+
+            <div id="embeddingDownload" class="download-item" style="display:none; margin-top: 20px;">
+                <div style="width:100%">
+                    <strong>Embedding Model Required</strong>
+                    <p id="embeddingStatus">Universal Sentence Encoder</p>
+                    <div id="embeddingProgress" class="progress-wrap" style="display:none;">
+                        <div class="progress-track">
+                            <div id="embeddingProgressBar" class="progress-fill"></div>
+                        </div>
+                        <small id="embeddingPct">0%</small>
+                    </div>
+                </div>
+                <button id="embeddingBtn" onclick="downloadEmbeddingModel()">Download</button>
+            </div>
         </div>
     </div>
 </div>
@@ -420,6 +448,9 @@
         <div class="setting-item">
             <button onclick="logoutWithReset()" class="toggle-btn" style="background: #ff4444; color: white; border: none;">Logout</button>
         </div>
+
+        <!-- Debug Section (Accessed via secret long press on Renews On) -->
+        <div id="debugTrigger" onclick="handleDebugTrigger()" style="opacity: 0; height: 10px; width: 100%;"></div>
     </div>
 </div>
 
@@ -451,6 +482,11 @@
         <div class="setting-item">
             <span>Renews on</span>
             <strong id="planExpiry">Unlimited</strong>
+        </div>
+
+        <div class="setting-item">
+            <button onclick="forceRevalidate()" class="toggle-btn" style="background: #4caf50; color: white; border: none;">Sync Subscription</button>
+            <p style="font-size: 11px; color: #888; margin-top: 5px; text-align: center; width: 100%;">Click if your subscription shows as expired but you have an active plan.</p>
         </div>
     </div>
 </div>

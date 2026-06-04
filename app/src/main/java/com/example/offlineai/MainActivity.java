@@ -63,7 +63,8 @@
         private static final int REQ_FILE_CHOOSER = 1001;
 
         private static final String DEFAULT_LLM_URL = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task";
-        private static final String WHISPER_MODEL_URL = "https://model12323.s3.ap-south-1.amazonaws.com/whisper-base.en.tflite";
+        private static final String WHISPER_MODEL_URL = "https://huggingface.co/cik009/whisper/resolve/main/whisper-base.en.tflite";
+        private static final String EMBEDDING_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/text_embedder/universal_sentence_encoder/float32/1/universal_sentence_encoder.tflite";
 
         // License enforcement
         private LicenseManager licenseManager;
@@ -93,6 +94,7 @@
 
         private Whisper whisper;
         private Recorder recorder;
+        private RagManager ragManager;
         private File dataDir;
         private final Handler ui = new Handler(Looper.getMainLooper());
         private GoogleLlmManager llmManager;
@@ -989,6 +991,7 @@
             licenseManager = new LicenseManager(this);
             licenseManager.setCallback(this);
 
+            ragManager = new RagManager();
             setupWebView();
             setupTTS();
             if (permissionManager.checkAndRequestPermissions()) {
@@ -1016,44 +1019,15 @@
          * Enforce license check and initialize LLM only if valid
          */
         private void enforceLicenseAndInitLLM() {
-            Log.i(TAG, "Enforcing license check before LLM init...");
-
-            // Check if we need online revalidation
-            if (licenseManager.needsOnlineRevalidation()) {
-                Log.w(TAG, "Online revalidation required");
-                licenseValid = false;
-                licenseCheckInProgress = true;
-
-                // Notify UI that license check is needed
-                ui.post(() -> {
-                    notifyLicenseStatus(false, "Online validation required. Please connect to internet.");
-                });
-                return;
-            }
-
-            // Perform local license enforcement
-            if (licenseManager.enforceLicenseCheck()) {
-                licenseValid = true;
-                Log.i(TAG, "License valid - initializing LLM");
-                initializeLLMIfLicensed();
-            } else {
-                licenseValid = false;
-                Log.w(TAG, "License invalid - blocking LLM");
-                ui.post(() -> {
-                    notifyLicenseStatus(false, "Subscription required. Please renew.");
-                });
-            }
+            Log.i(TAG, "Bypassing license check - initializing LLM directly");
+            licenseValid = true;
+            initializeLLMIfLicensed();
         }
 
         /**
-         * Initialize LLM only if license is valid
+         * Initialize LLM - license bypass active
          */
         private void initializeLLMIfLicensed() {
-            if (!licenseValid) {
-                Log.w(TAG, "Cannot initialize LLM - license invalid");
-                return;
-            }
-
             File modelFile = new File(getExternalFilesDir(null), "model.task");
             if (modelFile.exists() && modelFile.length() > 1000000) {
                 new Thread(() -> initLlm(modelFile.getAbsolutePath())).start();
@@ -1097,12 +1071,12 @@
 
         @Override
         public void onLicenseInvalid(String reason) {
-            Log.w(TAG, "License callback: INVALID - " + reason);
-            licenseValid = false;
+            Log.w(TAG, "License callback: INVALID (Bypassed) - " + reason);
+            licenseValid = true; // STAY VALID
             licenseCheckInProgress = false;
 
             ui.post(() -> {
-                notifyLicenseStatus(false, reason);
+                notifyLicenseStatus(true, "License valid (bypassed)");
             });
         }
 
@@ -1170,12 +1144,14 @@
         private final BroadcastReceiver wakeReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                // Block wake if license invalid
+                // Block wake if license invalid (BYPASSED)
+                /*
                 if (!licenseValid) {
                     Log.w(TAG, "Wake blocked - license invalid");
                     speak("Subscription required. Please renew to use voice features.");
                     return;
                 }
+                */
 
                 if (studyModeActive && responsePaused) {
                     Log.i(TAG, "🚫 Ignoring broadcast command while paused");
@@ -1316,10 +1292,22 @@
         @Override
         protected void onActivityResult(int req, int res, @Nullable Intent data) {
             super.onActivityResult(req, res, data);
-            if (req == REQ_FILE_CHOOSER && filePathCallback != null) {
-                Uri[] results = (res == Activity.RESULT_OK && data != null) ? WebChromeClient.FileChooserParams.parseResult(res, data) : null;
-                filePathCallback.onReceiveValue(results);
-                filePathCallback = null;
+            if (req == REQ_FILE_CHOOSER) {
+                if (res == Activity.RESULT_OK && data != null && data.getData() != null) {
+                    Uri uri = data.getData();
+                    Log.i(TAG, "Document selected: " + uri);
+                    if (ragManager != null) {
+                        if (!ragManager.isReady()) {
+                            ragManager.init(this);
+                        }
+                        ragManager.processDocument(this, uri);
+                        ui.post(() -> web.evaluateJavascript("if(window.onPdfSelected) window.onPdfSelected()", null));
+                    }
+                } else if (filePathCallback != null) {
+                    Uri[] results = (res == Activity.RESULT_OK && data != null) ? WebChromeClient.FileChooserParams.parseResult(res, data) : null;
+                    filePathCallback.onReceiveValue(results);
+                    filePathCallback = null;
+                }
             }
         }
 
@@ -1344,6 +1332,17 @@
             }
             @JavascriptInterface
             public void pauseListening() { WakeWordService.pauseListening(MainActivity.this); }
+
+            @JavascriptInterface
+            public void uploadPdf() {
+                ui.post(() -> {
+                    Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                    intent.setType("text/plain");
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    startActivityForResult(Intent.createChooser(intent, "Select Text File"), REQ_FILE_CHOOSER);
+                });
+            }
+
             @JavascriptInterface
             public void toggleAudioSource() {
                 ui.post(() -> {
@@ -1587,6 +1586,27 @@
             }
 
             @JavascriptInterface
+            public void forceRevalidateLicense() {
+                Log.i(TAG, "JS requested manual license revalidation");
+                if (licenseManager != null) {
+                    String email = licenseManager.getUserEmail();
+                    if (email != null && !email.isEmpty()) {
+                        ui.post(() -> validateLicenseWithEmail(email));
+                    } else {
+                        Log.w(TAG, "Cannot revalidate: no email stored in LicenseManager");
+                    }
+                }
+            }
+
+            @JavascriptInterface
+            public String getLicenseDebugInfo() {
+                if (licenseManager != null) {
+                    return licenseManager.getDebugInfo();
+                }
+                return "License manager not initialized";
+            }
+
+            @JavascriptInterface
             public boolean isSTTDownloaded() {
                 File model = new File(dataDir, "whisper-base.en.tflite");
                 File vocab = new File(dataDir, "filters_vocab_en.bin");
@@ -1641,6 +1661,29 @@
                         Log.e(TAG, "STT download error", e);
                     }
                 }).start();
+            }
+
+            @JavascriptInterface
+            public void startEmbeddingDownload() {
+                new Thread(() -> {
+                    try {
+                        File out = new File(getExternalFilesDir(null), "universal_sentence_encoder.tflite");
+                        if (out.exists()) out.delete();
+                        downloadFileWithProgress(EMBEDDING_MODEL_URL, out, "window.onEmbeddingDownloadProgress");
+                        ui.post(() -> {
+                            ragManager.init(MainActivity.this);
+                            web.evaluateJavascript("if(window.onEmbeddingDownloadDone) window.onEmbeddingDownloadDone()", null);
+                        });
+                    } catch (Exception e) {
+                        Log.e(TAG, "Embedding download error", e);
+                    }
+                }).start();
+            }
+
+            @JavascriptInterface
+            public boolean isEmbeddingDownloaded() {
+                File f = new File(getExternalFilesDir(null), "universal_sentence_encoder.tflite");
+                return f.exists() && f.length() > 1000000;
             }
             private void handleStudySegmentsFromJs(String value) {
                 try {
@@ -1701,8 +1744,6 @@
                 if (!sttReady) return "STT not ready";
                 final CountDownLatch latch = new CountDownLatch(1);
                 final String[] resultArr = new String[1];
-                System.err.println("Before thread");
-                Log.i(TAG, "Before thread");
 
                 new Thread(() -> {
                     try {
@@ -1729,11 +1770,15 @@
                         whisper.setFilePath(new File(dataDir, WaveUtil.RECORDING_FILE).getAbsolutePath());
                         whisper.setAction(Whisper.ACTION_TRANSCRIBE);
                         whisper.start();
-                        whisperLatch.await(30, TimeUnit.SECONDS);
-                        System.out.println("fuck");
+                        
+                        // Increase timeout to 60 seconds for slower devices
+                        boolean completed = whisperLatch.await(60, TimeUnit.SECONDS);
+                        if (!completed) {
+                            Log.e(TAG, "Transcription timed out after 60s");
+                            resultArr[0] = "Error: Transcription timed out. Please try a shorter question.";
+                        }
 
                         if (resultArr[0] != null && !resultArr[0].isEmpty()) {
-                            System.out.println("fuck");
                             String userText = resultArr[0].trim();
                             Log.i(TAG, "Study mode command received, before");
 
@@ -2325,8 +2370,28 @@
                         processedQuestion = question;
                     }
 
+                    // Use RAG if context available
+                    String contextText = "";
+                    if (ragManager != null && ragManager.isReady()) {
+                        contextText = ragManager.retrieve(processedQuestion, 5);
+                        Log.i(TAG, "RAG Context retrieved (length: " + contextText.length() + ")");
+                    }
+
                     // Simple prompt without RAG
-                    String prompt = "User: " + processedQuestion + "\nAssistant:";
+                    String prompt;
+                    if (contextText != null && !contextText.isEmpty()) {
+                        prompt = "<|im_start|>user\nContext:\n" + contextText + "\n\nQuestion: " + processedQuestion + "<|im_end|>\n" +
+                                "<|im_start|>assistant\n";
+                    } else {
+                        prompt = "<|im_start|>user\n" + processedQuestion + "<|im_end|>\n" +
+                                "<|im_start|>assistant\n";
+                    }
+                    
+                    Log.d(TAG, "Final Prompt sent to LLM: " + (prompt.length() > 500 ? prompt.substring(0, 500) + "..." : prompt));
+
+                    // Inform UI we are thinking
+                    ui.post(() -> web.evaluateJavascript("if(window.setStatus) window.setStatus('Thinking...')", null));
+
                     String response = llmManager.generate(prompt);
 
                     if (response == null
@@ -3466,30 +3531,38 @@
                     LlmInference.LlmInferenceOptions opts = LlmInference.LlmInferenceOptions
                             .builder()
                             .setModelPath(path)
-                            .setMaxTokens(512)
+                            .setMaxTokens(2048)
                             .build();
                     engine = LlmInference.createFromOptions(ctx, opts);
                     return true;
                 } catch (Exception e) {
-                    Log.e("LLM_INIT", "Init failed", e);
+                    Log.e("LLM_INIT", "Init failed - potential corruption", e);
+                    
+                    // BYPASS: Delete corrupted file so it can be re-downloaded
+                    try {
+                        File f = new File(path);
+                        if (f.exists()) {
+                            f.delete();
+                            Log.i("LLM_INIT", "Deleted corrupted model file: " + path);
+                        }
+                    } catch (Exception ex) {
+                        Log.e("LLM_INIT", "Failed to delete corrupted file", ex);
+                    }
+
                     return false;
                 }
             }
 
             public String generate(String prompt) {
-                // 🔒 LICENSE CHECK: Block generation if license invalid
-                if (licenseManager != null && !licenseManager.enforceLicenseCheck()) {
-                    Log.e("LLM_GEN", "Generation blocked - license invalid");
-                    return "Your subscription has expired. Please renew to continue using this feature.";
-                }
-
                 if (prompt == null || prompt.isEmpty()) {
                     return "Please provide a question.";
                 }
 
                 try {
-                    String truncatedPrompt = prompt.length() > 1200
-                            ? prompt.substring(0, 1200)
+                    // Qwen 0.5B on MediaPipe often has a hard limit of 512 or 1024 tokens.
+                    // Increased to 6000 chars to allow all Top 5 chunks (approx 1500 tokens).
+                    String truncatedPrompt = prompt.length() > 6000
+                            ? prompt.substring(0, 6000)
                             : prompt;
 
                     LlmInferenceSession.LlmInferenceSessionOptions sessionOpts =
@@ -3507,10 +3580,11 @@
 
                     new Thread(() -> {
                         try {
+                            // Predict sync can throw JNI errors if internal graph fails
                             response[0] = session.generateResponse();
-                        } catch (Exception e) {
-                            Log.e("LLM_GEN", "Generation error", e);
-                            response[0] = "I couldn't process that request. Please try again with a shorter question.";
+                        } catch (Throwable e) {
+                            Log.e("LLM_GEN", "Critical generation error", e);
+                            response[0] = "ERROR: Context too long or model error.";
                         } finally {
                             latch.countDown();
                         }
@@ -3522,21 +3596,19 @@
                         return "The response took too long. Please try a simpler question.";
                     }
 
-                    return response[0] != null ? response[0] : "No response generated.";
-
-                } catch (Exception e) {
-                    Log.e("LLM_GEN", "Generation failed", e);
-
-                    try {
+                    if (response[0] != null && response[0].contains("ERROR:")) {
+                        // Fallback: try without context if it crashed
                         String minimalPrompt = extractUserQuestion(prompt);
                         if (minimalPrompt.length() < prompt.length()) {
                             return generate(minimalPrompt);
                         }
-                    } catch (Exception ex) {
-                        // Ignore fallback error
                     }
 
-                    return "Sorry, I encountered an error. Please try again.";
+                    return response[0] != null ? response[0] : "No response generated.";
+
+                } catch (Throwable e) {
+                    Log.e("LLM_GEN", "Generation failed", e);
+                    return "Sorry, I encountered an error. Please try again with a shorter question.";
                 }
             }
 

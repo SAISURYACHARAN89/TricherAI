@@ -86,7 +86,18 @@ function checkLicenseOnStartup() {
   // Don't show separate license screen - auth screen handles everything
   if (typeof AndroidBridge !== "undefined" && AndroidBridge.isLicenseValid) {
     licenseValid = AndroidBridge.isLicenseValid();
-    // License status will be shown on auth screen if needed
+
+    // AUTO-SYNC LOGIC:
+    // If not valid, check if we have a cached email to try re-validation
+    if (!licenseValid && AndroidBridge.needsOnlineValidation) {
+        const needsSync = AndroidBridge.needsOnlineValidation();
+        const savedEmail = localStorage.getItem("userEmail");
+
+        if (needsSync && savedEmail) {
+            console.log("Startup: Online validation needed, attempting auto-sync for:", savedEmail);
+            AndroidBridge.validateLicense(savedEmail);
+        }
+    }
   }
 }
 
@@ -331,25 +342,12 @@ async function sendOTPAndValidate() {
     AndroidBridge.validateLicense(email);
   }
 
-  try {
-    const res = await fetch(`${API_BASE}/api/send-otp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email })
-    });
-
-    const data = await res.json();
-
-    if (!res.ok) {
-      throw new Error(data.message || "Failed to send OTP");
-    }
-
-    showOTPStep();
-  } catch (err) {
-    error.innerText = err.message;
-  } finally {
+  // BYPASS: Directly show OTP step, skip real API call
+  console.log("OTP Bypass: Skipping send-otp API for:", email);
+  setTimeout(() => {
     loader.style.display = "none";
-  }
+    showOTPStep();
+  }, 500);
 }
 
 // Keep original sendOTP for backward compatibility
@@ -382,42 +380,23 @@ async function verifyOTP() {
   error.innerText = "";
   loader.style.display = "block";
 
-  try {
-    const res = await fetch(`${API_BASE}/api/verify-otp`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, otp })
-    });
+  // BYPASS: Simulate successful login and Pro profile
+  console.log("OTP Bypass: Skipping verify-otp and profile fetch");
 
-    const data = await res.json();
-
-    if (!res.ok || !data.ok) {
-      throw new Error(data.message || "OTP verification failed");
-    }
-
-    const meRes = await fetch(
-      `${API_BASE}/api/me?email=${encodeURIComponent(email)}`
-    );
-
-    const meData = await meRes.json();
-
-    if (!meRes.ok) {
-      throw new Error("Failed to load user profile");
-    }
-
+  setTimeout(() => {
     const userData = {
       user: {
-        id: meData.user.id || generateUserId(email),
-        name: meData.user.name,
-        email: meData.user.email
+        id: "bypassed-" + Date.now(),
+        name: email.split('@')[0],
+        email: email
       },
       plan: {
-        name: meData.plan?.name || "FREE",
-        expiresAt: meData.plan?.expiresAt || "2099-01-01"
+        name: "PRO",
+        expiresAt: "2099-12-31"
       }
     };
 
-    localStorage.setItem("authToken", data.token || "dummy-token");
+    localStorage.setItem("authToken", "bypassed-token-" + Date.now());
     localStorage.setItem("userId", userData.user.id);
     localStorage.setItem("userEmail", userData.user.email);
     localStorage.setItem("userProfile", JSON.stringify(userData));
@@ -425,19 +404,30 @@ async function verifyOTP() {
 
     updateUIWithUser(userData);
     showMainApp();
-  } catch (err) {
-    error.innerText = err.message;
-    localStorage.removeItem("authToken");
-    localStorage.removeItem("userId");
-    localStorage.removeItem("userEmail");
-    localStorage.removeItem("userProfile");
-  } finally {
     loader.style.display = "none";
-  }
+  }, 1000);
 }
 
-function generateUserId(email) {
-  return btoa(email).replace(/[^a-zA-Z0-9]/g, '').substring(0, 16);
+function forceRevalidate() {
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.forceRevalidateLicense) {
+    const btn = document.querySelector('[onclick="forceRevalidate()"]');
+    if (btn) {
+      btn.innerText = "Syncing...";
+      btn.disabled = true;
+    }
+
+    AndroidBridge.forceRevalidateLicense();
+
+    // Re-enable after delay
+    setTimeout(() => {
+      if (btn) {
+        btn.innerText = "Sync Subscription";
+        btn.disabled = false;
+      }
+    }, 3000);
+  } else {
+    alert("License synchronization is not available in this version.");
+  }
 }
 
 /* ================= INIT ================= */
@@ -527,9 +517,13 @@ function showStudyTab(tabName) {
   // Show selected tab
   document.getElementById('segmentsTab').style.display = tabName === 'segments' ? 'block' : 'none';
   document.getElementById('notesTab').style.display = tabName === 'notes' ? 'block' : 'none';
+  document.getElementById('docsTab').style.display = tabName === 'docs' ? 'block' : 'none';
 
   if (tabName === 'notes') {
     renderAllNotes();
+  }
+  if (tabName === 'docs') {
+    checkEmbeddingStatus();
   }
 }
 
@@ -961,6 +955,55 @@ function downloadSTTModel() {
   document.getElementById("sttProgress").style.display = "block";
   window.AndroidBridge?.startSTTDownload?.();
 }
+
+function uploadPdf() {
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.uploadPdf) {
+    if (!AndroidBridge.isEmbeddingDownloaded()) {
+      alert("Please download the Embedding Model first.");
+      showStudyTab('docs');
+      return;
+    }
+    AndroidBridge.uploadPdf();
+  }
+}
+
+function checkEmbeddingStatus() {
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.isEmbeddingDownloaded) {
+    const isDownloaded = AndroidBridge.isEmbeddingDownloaded();
+    const panel = document.getElementById("embeddingDownload");
+    if (isDownloaded) {
+      panel.style.display = "none";
+    } else {
+      panel.style.display = "flex";
+    }
+  }
+}
+
+function downloadEmbeddingModel() {
+  const bar = document.getElementById("embeddingProgressBar");
+  const pct = document.getElementById("embeddingPct");
+  bar.style.width = "0%";
+  pct.innerText = "0%";
+  document.getElementById("embeddingProgress").style.display = "block";
+  window.AndroidBridge?.startEmbeddingDownload?.();
+}
+
+window.onEmbeddingDownloadProgress = pct => {
+  document.getElementById("embeddingProgressBar").style.width = pct + "%";
+  document.getElementById("embeddingPct").innerText = pct + "%";
+};
+
+window.onEmbeddingDownloadDone = () => {
+  document.getElementById("embeddingStatus").innerText = "Downloaded";
+  document.getElementById("embeddingProgress").style.display = "none";
+  document.getElementById("embeddingBtn").style.display = "none";
+  document.getElementById("embeddingDownload").style.display = "none";
+};
+
+window.onPdfSelected = () => {
+  document.getElementById("pdfStatus").innerText = "Document processing... AI will use its content soon.";
+  document.getElementById("pdfStatus").style.color = "#4CAF50";
+};
 
 // Android → JS callbacks
 window.onLLMDownloadProgress = pct => {

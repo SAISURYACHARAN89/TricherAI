@@ -35,7 +35,6 @@ public class Whisper {
     }
 
     private final AtomicBoolean mInProgress = new AtomicBoolean(false);
-    private final Queue<float[]> audioBufferQueue = new LinkedList<>();
 
     private final WhisperEngine mWhisperEngine;
     private Action mAction;
@@ -50,13 +49,9 @@ public class Whisper {
         this.mWhisperEngine = new WhisperEngineJava(context);
 //        this.mWhisperEngine = new WhisperEngineNative(context);
 
-        // Start thread for file transcription for file transcription
+        // Start thread for file transcription
         Thread threadTranscbFile = new Thread(this::transcribeFileLoop);
         threadTranscbFile.start();
-
-        // Start thread for buffer transcription for live mic feed transcription
-        Thread threadTranscbBuffer = new Thread(this::transcribeBufferLoop);
-        threadTranscbBuffer.start();
     }
 
     public void setListener(WhisperListener listener) {
@@ -89,10 +84,8 @@ public class Whisper {
     }
 
     public void start() {
-        if (!mInProgress.compareAndSet(false, true)) {
-            Log.d(TAG, "Execution is already in progress...");
-            return;
-        }
+        // Force state to in progress to ensure loop picks it up
+        mInProgress.set(true);
         taskLock.lock();
         try {
             taskAvailable = true;
@@ -175,37 +168,5 @@ public class Whisper {
         }
     }
 
-    /////////////////////// Live MIC feed transcription calls /////////////////////////////////
-    private void transcribeBufferLoop() {
-        while (!Thread.currentThread().isInterrupted()) {
-            float[] samples = readBuffer();
-            if (samples != null) {
-                synchronized (mWhisperEngine) {
-                    String result = mWhisperEngine.transcribeBuffer(samples);
-                    sendResult(result);
-                }
-            }
-        }
-    }
-
-    public void writeBuffer(float[] samples) {
-        synchronized (audioBufferQueue) {
-            audioBufferQueue.add(samples);
-            audioBufferQueue.notify();
-        }
-    }
-
-    private float[] readBuffer() {
-        synchronized (audioBufferQueue) {
-            while (audioBufferQueue.isEmpty()) {
-                try {
-                    audioBufferQueue.wait();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return null;
-                }
-            }
-            return audioBufferQueue.poll();
-        }
-    }
+    /////////////////////// Unused live mic feed methods removed /////////////////////////////////
 }

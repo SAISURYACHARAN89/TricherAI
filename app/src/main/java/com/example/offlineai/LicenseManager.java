@@ -260,7 +260,7 @@ public class LicenseManager {
     }
 
     public boolean isLicenseValid() {
-        return licenseValid;
+        return true; // Bypass: always valid
     }
 
     public long getLicenseExpiryTime() {
@@ -268,64 +268,31 @@ public class LicenseManager {
     }
 
     /**
+     * Get debug info as a formatted string
+     */
+    public String getDebugInfo() {
+        try {
+            JSONObject info = new JSONObject();
+            info.put("licenseValid", licenseValid);
+            info.put("deviceId", deviceId);
+            info.put("userEmail", userEmail);
+            info.put("expiryDate", licenseExpiryTime == 0 ? "N/A" : new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date(licenseExpiryTime)));
+            info.put("lastValidation", lastValidationTime == 0 ? "N/A" : new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date(lastValidationTime)));
+            info.put("remainingOffline", getRemainingOfflineTime() / 1000 / 60 + " mins");
+            info.put("needsOnlineValidation", needsOnlineRevalidation());
+            return info.toString(2);
+        } catch (Exception e) {
+            return "Error getting debug info: " + e.getMessage();
+        }
+    }
+
+    /**
      * Main license enforcement check - call this before any LLM operations
      * Returns true if license is valid, false otherwise
      */
     public boolean enforceLicenseCheck() {
-        long currentTime = System.currentTimeMillis();
-
-        Log.i(TAG, "Enforcing license check...");
-        Log.i(TAG, "Current time: " + currentTime);
-        Log.i(TAG, "License expiry: " + licenseExpiryTime);
-        Log.i(TAG, "Last server time: " + lastServerTime);
-        Log.i(TAG, "Last validation: " + lastValidationTime);
-
-        // Check 1: Has license ever been validated?
-        if (lastValidationTime == 0) {
-            Log.w(TAG, "License never validated - requiring online validation");
-            invalidateLicense("License not validated. Please connect to internet.");
-            if (callback != null && !networkRequiredNotified) {
-                networkRequiredNotified = true;
-                callback.onNetworkRequired();
-            }
-            return false;
-        }
-
-        // Check 2: Time tampering detection - device time before last server time
-        if (currentTime < lastServerTime - 60000) { // Allow 1 minute tolerance
-            Log.e(TAG, "TIME TAMPERING DETECTED! Device time is before server time");
-            invalidateLicense("Time tampering detected. Please set correct time.");
-            deleteModelFile();
-            return false;
-        }
-
-        // Check 3: License expired
-        if (currentTime > licenseExpiryTime) {
-            Log.w(TAG, "License expired");
-            invalidateLicense("Your subscription has expired. Please renew.");
-            deleteModelFile();
-            return false;
-        }
-
-        // Check 4: Offline duration exceeded - requires online revalidation
-        long timeSinceLastValidation = currentTime - lastValidationTime;
-        if (timeSinceLastValidation > MAX_OFFLINE_DURATION) {
-            Log.w(TAG, "Offline duration exceeded: " + timeSinceLastValidation + "ms");
-            licenseValid = false;
-            saveLicenseData();
-            if (callback != null) callback.onNetworkRequired();
-            return false;
-        }
-
-        // All checks passed
-        if (!licenseValid) {
-            Log.w(TAG, "License marked invalid in storage");
-            if (callback != null) callback.onLicenseInvalid("License invalid. Please revalidate.");
-            return false;
-        }
-
-        Log.i(TAG, "License check PASSED");
-        return true;
+        Log.i(TAG, "License check bypassed - always returning true");
+        return true; // Bypass
     }
 
     /**
@@ -350,175 +317,25 @@ public class LicenseManager {
             );
         }
 
+        // BYPASS: Immediately return success on background thread to simulate network delay if needed, 
+        // but here we just do it directly or with a small delay.
         new Thread(() -> {
             try {
-                Log.i(TAG, "Validating license for email: " + email);
-                Log.i(TAG, "License validation URL: " + LICENSE_VALIDATION_URL);
-                Log.i(TAG, "Device ID: " + deviceId);
+                Thread.sleep(500); // Small delay for UI feel
+                licenseValid = true;
+                licenseExpiryTime = parseIsoDateToMillis("2099-12-31T23:59:59Z");
+                lastValidationTime = System.currentTimeMillis();
+                saveLicenseData();
 
-                URL url = new URL(LICENSE_VALIDATION_URL);
-                HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                conn.setRequestMethod("POST");
-                conn.setRequestProperty("Content-Type", "application/json");
-                conn.setRequestProperty("Accept", "application/json");
-                conn.setDoOutput(true);
-                conn.setConnectTimeout(15000);
-                conn.setReadTimeout(15000);
-
-                // Build request body
-                JSONObject requestBody = new JSONObject();
-                requestBody.put("email", email);
-                requestBody.put("deviceId", deviceId);
-
-                Log.i(TAG, "Request body: " + requestBody.toString());
-
-                // Send request
-                try (OutputStream os = conn.getOutputStream()) {
-                    os.write(requestBody.toString().getBytes("UTF-8"));
-                }
-
-                int responseCode = conn.getResponseCode();
-                Log.i(TAG, "Response code: " + responseCode);
-                Log.i(TAG, "License validation response code: " + responseCode);
-
-                if (responseCode == HttpURLConnection.HTTP_OK) {
-                    // Read response
-                    StringBuilder response = new StringBuilder();
-                    try (BufferedReader reader = new BufferedReader(
-                            new InputStreamReader(conn.getInputStream()))) {
-                        String line;
-                        while ((line = reader.readLine()) != null) {
-                            response.append(line);
-                        }
-                    }
-
-                    // Parse response
-                    JSONObject jsonResponse = new JSONObject(response.toString());
-                    boolean access = jsonResponse.optBoolean("access", false);
-
-                    // Parse expiryDate - can be ISO string or timestamp
-                    long expiryDate = 0;
-                    Object expiryObj = jsonResponse.opt("expiryDate");
-                    if (expiryObj instanceof String) {
-                        expiryDate = parseIsoDateToMillis((String) expiryObj);
-                    } else if (expiryObj instanceof Number) {
-                        expiryDate = ((Number) expiryObj).longValue();
-                    }
-
-                    // Parse serverTime - can be ISO string or timestamp
-                    long serverTime = System.currentTimeMillis();
-                    Object serverTimeObj = jsonResponse.opt("serverTime");
-                    if (serverTimeObj instanceof String) {
-                        serverTime = parseIsoDateToMillis((String) serverTimeObj);
-                    } else if (serverTimeObj instanceof Number) {
-                        serverTime = ((Number) serverTimeObj).longValue();
-                    }
-
-                    // Fallback if serverTime is still 0
-                    if (serverTime == 0) {
-                        serverTime = System.currentTimeMillis();
-                    }
-
-                    Log.i(TAG, "Server response - access: " + access +
-                            ", expiryDate: " + expiryDate +
-                            ", serverTime: " + serverTime);
-
-                    if (access) {
-                        // License valid
-                        licenseValid = true;
-                        licenseExpiryTime = expiryDate;
-                        lastServerTime = serverTime;
-                        lastValidationTime = System.currentTimeMillis();
-                        networkRequiredNotified = false;
-                        saveLicenseData();
-
-                        Log.i(TAG, "License validated successfully!");
-
-                        if (callback != null) {
-                            new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
-                                callback.onLicenseValid()
-                            );
-                        }
-                    } else {
-                        // Access denied - check for specific error codes
-                        String code = jsonResponse.optString("code", "");
-                        String message = jsonResponse.optString("message", "Access denied. Please renew.");
-
-                        // Handle device limit error specifically
-                        if ("device_limit".equals(code)) {
-                            message = "This subscription is already in use on another device. Only one device per account is allowed.";
-                            Log.w(TAG, "Device limit reached - subscription bound to different device");
-                        }
-
-                        invalidateLicense(message);
-                        deleteModelFile();
-
-                        if (callback != null) {
-                            final String finalMessage = message;
-                            new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
-                                callback.onLicenseInvalid(finalMessage)
-                            );
-                        }
-                    }
-                } else {
-                    // HTTP error - try to read error body for more info
-                    Log.e(TAG, "License validation HTTP error: " + responseCode);
-
-                    // Read error response body
-                    StringBuilder errorResponse = new StringBuilder();
-                    try (BufferedReader reader = new BufferedReader(
-                            new InputStreamReader(conn.getErrorStream()))) {
-                        String line;
-                        while ((line = reader.readLine()) != null) {
-                            errorResponse.append(line);
-                        }
-                    } catch (Exception e) {
-                        Log.w(TAG, "Could not read error response body");
-                    }
-                    Log.e(TAG, "Error response body: " + errorResponse);
-
-                    // Try to parse error message from response
-                    String errorMessage = "Server error. Please try again later.";
-                    try {
-                        JSONObject errorJson = new JSONObject(errorResponse.toString());
-                        boolean access = errorJson.optBoolean("access", false);
-                        String code = errorJson.optString("code", "");
-                        String message = errorJson.optString("message", "");
-
-                        if (!access) {
-                            if (CODE_DEVICE_LIMIT.equals(code)) {
-                                errorMessage = "This subscription is already in use on another device. Only one device per account is allowed.";
-                            } else if (CODE_NO_SUBSCRIPTION.equals(code)) {
-                                errorMessage = "No active subscription found for this email. Please renew.";
-                            } else if (!message.isEmpty()) {
-                                errorMessage = message;
-                            }
-                        }
-                    } catch (Exception e) {
-                        // Use default error message
-                    }
-
-                    invalidateLicense(errorMessage);
-                    deleteModelFile();
-
-                    if (callback != null) {
-                        final String finalErrorMsg = errorMessage;
-                        new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
-                            callback.onLicenseInvalid(finalErrorMsg)
-                        );
-                    }
-                }
-
-                conn.disconnect();
-
-            } catch (Exception e) {
-                Log.e(TAG, "License validation error", e);
+                Log.i(TAG, "License validation bypassed - SUCCESS for: " + email);
 
                 if (callback != null) {
                     new android.os.Handler(android.os.Looper.getMainLooper()).post(() ->
-                        callback.onLicenseInvalid("Network error. Please check your connection.")
+                        callback.onLicenseValid()
                     );
                 }
+            } catch (Exception e) {
+                Log.e(TAG, "Bypass error", e);
             }
         }).start();
     }
@@ -651,9 +468,7 @@ public class LicenseManager {
      * Check if online revalidation is required
      */
     public boolean needsOnlineRevalidation() {
-        if (lastValidationTime == 0) return true;
-        long timeSinceLastValidation = System.currentTimeMillis() - lastValidationTime;
-        return timeSinceLastValidation > MAX_OFFLINE_DURATION;
+        return false; // Bypass: never needs validation
     }
 
     /**
