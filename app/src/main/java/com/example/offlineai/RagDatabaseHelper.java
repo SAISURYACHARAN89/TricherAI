@@ -59,6 +59,30 @@ public class RagDatabaseHelper extends SQLiteOpenHelper {
         return db.insert(TABLE_DOCUMENTS, null, values);
     }
 
+    public void deleteDocumentByName(String name) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        Cursor cursor = db.query(
+                TABLE_DOCUMENTS,
+                new String[]{COLUMN_DOC_ID},
+                COLUMN_DOC_NAME + " = ?",
+                new String[]{name},
+                null,
+                null,
+                null
+        );
+
+        try {
+            while (cursor.moveToNext()) {
+                long docId = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_DOC_ID));
+                db.delete(TABLE_CHUNKS, COLUMN_CHUNK_DOC_ID + " = ?", new String[]{String.valueOf(docId)});
+            }
+        } finally {
+            cursor.close();
+        }
+
+        db.delete(TABLE_DOCUMENTS, COLUMN_DOC_NAME + " = ?", new String[]{name});
+    }
+
     public void insertChunk(long docId, String text, float[] embedding) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -68,17 +92,48 @@ public class RagDatabaseHelper extends SQLiteOpenHelper {
         db.insert(TABLE_CHUNKS, null, values);
     }
 
+    public List<String> getAllDocumentNames() {
+        List<String> names = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.query(
+                TABLE_DOCUMENTS,
+                new String[]{COLUMN_DOC_NAME},
+                null,
+                null,
+                null,
+                null,
+                COLUMN_DOC_ID + " DESC"
+        );
+
+        try {
+            while (cursor.moveToNext()) {
+                String name = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_DOC_NAME));
+                if (name != null && !name.trim().isEmpty()) {
+                    names.add(name);
+                }
+            }
+        } finally {
+            cursor.close();
+        }
+
+        return names;
+    }
+
     public List<RagManager.DocumentChunk> getAllChunks() {
         List<RagManager.DocumentChunk> chunks = new ArrayList<>();
         SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.query(TABLE_CHUNKS, null, null, null, null, null, null);
+        String sql = "SELECT c." + COLUMN_CHUNK_DOC_ID + ", d." + COLUMN_DOC_NAME + ", c." + COLUMN_CHUNK_TEXT + ", c." + COLUMN_CHUNK_EMBEDDING +
+                " FROM " + TABLE_CHUNKS + " c INNER JOIN " + TABLE_DOCUMENTS + " d ON c." + COLUMN_CHUNK_DOC_ID + " = d." + COLUMN_DOC_ID;
+        Cursor cursor = db.rawQuery(sql, null);
 
         if (cursor.moveToFirst()) {
             do {
+                long docId = cursor.getLong(cursor.getColumnIndexOrThrow(COLUMN_CHUNK_DOC_ID));
+                String docName = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_DOC_NAME));
                 String text = cursor.getString(cursor.getColumnIndexOrThrow(COLUMN_CHUNK_TEXT));
                 byte[] blob = cursor.getBlob(cursor.getColumnIndexOrThrow(COLUMN_CHUNK_EMBEDDING));
                 float[] embedding = toFloatArray(blob);
-                chunks.add(new RagManager.DocumentChunk(text, embedding));
+                chunks.add(new RagManager.DocumentChunk(docId, docName, text, embedding));
             } while (cursor.moveToNext());
         }
         cursor.close();

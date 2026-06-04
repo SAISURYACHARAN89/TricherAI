@@ -131,6 +131,7 @@ window.onLicenseExpired = function() {
 let studySegments = [];
 let currentEditingSegment = null;
 let currentTab = 'segments';
+let uploadedDocs = [];
 
 // Load study data from localStorage
 // Load study data from localStorage
@@ -466,6 +467,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadFreeTime();
   loadSettings();
   loadStudyData();
+  loadUploadedDocuments();
 
   // Check license status on startup
   checkLicenseOnStartup();
@@ -512,7 +514,12 @@ function showStudyTab(tabName) {
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.remove('active');
   });
-  event.target.classList.add('active');
+  if (typeof event !== "undefined" && event.target) {
+    event.target.classList.add('active');
+  } else {
+    const btn = document.querySelector(`.tab-btn[onclick*="'${tabName}'"]`);
+    if (btn) btn.classList.add('active');
+  }
 
   // Show selected tab
   document.getElementById('segmentsTab').style.display = tabName === 'segments' ? 'block' : 'none';
@@ -524,6 +531,7 @@ function showStudyTab(tabName) {
   }
   if (tabName === 'docs') {
     checkEmbeddingStatus();
+    loadUploadedDocuments();
   }
 }
 
@@ -963,9 +971,123 @@ function uploadPdf() {
       showStudyTab('docs');
       return;
     }
+    showDocumentUploadState("uploading", "Preparing file picker...");
     AndroidBridge.uploadPdf();
   }
 }
+
+function loadUploadedDocuments() {
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.getUploadedDocuments) {
+    try {
+      const raw = AndroidBridge.getUploadedDocuments();
+      const parsed = raw ? JSON.parse(raw) : [];
+      onDocumentsLoaded(Array.isArray(parsed) ? parsed : []);
+    } catch (e) {
+      console.error("Failed to load uploaded docs", e);
+      onDocumentsLoaded([]);
+    }
+  }
+}
+
+function removeUploadedDocument(fileName) {
+  if (!fileName) return;
+  if (!confirm(`Remove \"${fileName}\" from documents?`)) return;
+
+  if (typeof AndroidBridge !== "undefined" && AndroidBridge.removeUploadedDocument) {
+    AndroidBridge.removeUploadedDocument(fileName);
+  }
+
+  uploadedDocs = uploadedDocs.filter(name => name !== fileName);
+  renderUploadedDocs();
+}
+
+function renderUploadedDocs() {
+  const container = document.getElementById("uploadedDocsList");
+  if (!container) return;
+
+  container.innerHTML = "";
+  if (!uploadedDocs.length) {
+    container.innerHTML = '<p style="color:#888; font-size:12px; margin:0;">No uploaded documents yet.</p>';
+    return;
+  }
+
+  uploadedDocs.forEach(name => {
+    const row = document.createElement("div");
+    row.className = "segment-item";
+
+    const title = document.createElement("div");
+    title.style.flex = "1";
+    const strong = document.createElement("strong");
+    strong.textContent = name;
+    title.appendChild(strong);
+
+    const actions = document.createElement("div");
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "delete-btn";
+    removeBtn.textContent = "Remove";
+    removeBtn.onclick = () => removeUploadedDocument(name);
+    actions.appendChild(removeBtn);
+
+    row.appendChild(title);
+    row.appendChild(actions);
+    container.appendChild(row);
+  });
+}
+
+function showDocumentUploadState(state, message) {
+  const wrap = document.getElementById("docUploadStatus");
+  const text = document.getElementById("docUploadText");
+  const spinner = document.getElementById("docUploadSpinner");
+  const pdfStatus = document.getElementById("pdfStatus");
+  if (!wrap || !text || !spinner || !pdfStatus) return;
+
+  if (state === "idle") {
+    wrap.classList.remove("show");
+    spinner.classList.remove("show");
+    pdfStatus.innerText = "Upload TXT files to help the AI answer questions about them.";
+    pdfStatus.style.color = "#888";
+    return;
+  }
+
+  wrap.classList.add("show");
+  text.innerText = message || "Working...";
+
+  if (state === "uploading") {
+    spinner.classList.add("show");
+    wrap.style.color = "#555";
+  } else if (state === "uploaded") {
+    spinner.classList.remove("show");
+    wrap.style.color = "#2e7d32";
+  } else if (state === "error") {
+    spinner.classList.remove("show");
+    wrap.style.color = "#b71c1c";
+  }
+}
+
+window.onDocumentsLoaded = docs => {
+  uploadedDocs = Array.isArray(docs) ? docs : [];
+  renderUploadedDocs();
+};
+
+window.onDocumentUploadState = (state, fileName, message) => {
+  if (state === "uploading") {
+    const label = fileName ? `Uploading ${fileName}...` : "Uploading...";
+    showDocumentUploadState("uploading", label);
+    return;
+  }
+
+  if (state === "uploaded") {
+    const label = fileName ? `${fileName} uploaded` : "Uploaded";
+    showDocumentUploadState("uploaded", label);
+    setTimeout(() => showDocumentUploadState("idle"), 2000);
+    loadUploadedDocuments();
+    return;
+  }
+
+  if (state === "error") {
+    showDocumentUploadState("error", message || "Upload failed");
+  }
+};
 
 function checkEmbeddingStatus() {
   if (typeof AndroidBridge !== "undefined" && AndroidBridge.isEmbeddingDownloaded) {
@@ -1001,8 +1123,7 @@ window.onEmbeddingDownloadDone = () => {
 };
 
 window.onPdfSelected = () => {
-  document.getElementById("pdfStatus").innerText = "Document processing... AI will use its content soon.";
-  document.getElementById("pdfStatus").style.color = "#4CAF50";
+  showDocumentUploadState("uploading", "Uploading and processing...");
 };
 
 // Android → JS callbacks

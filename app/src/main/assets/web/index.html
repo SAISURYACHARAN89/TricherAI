@@ -82,6 +82,41 @@
   border-radius: 8px;
 }
 
+.doc-status {
+  margin-top: 10px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #f6f6f6;
+  font-size: 12px;
+  color: #555;
+  display: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.doc-status.show {
+  display: flex;
+}
+
+.doc-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #d0d0d0;
+  border-top: 2px solid #111;
+  border-radius: 50%;
+  animation: doc-spin 0.8s linear infinite;
+  display: none;
+}
+
+.doc-spinner.show {
+  display: inline-block;
+}
+
+@keyframes doc-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* ================= BUTTONS (B/W ONLY) ================= */
 
 .add-btn,
@@ -355,6 +390,16 @@
 
             <div id="pdfStatus" style="font-size: 12px; color: #888; margin-top: 10px;">
                 Upload TXT files to help the AI answer questions about them.
+            </div>
+
+            <div id="docUploadStatus" class="doc-status" style="margin-top: 10px;">
+                <span id="docUploadSpinner" class="doc-spinner"></span>
+                <span id="docUploadText">Ready to upload</span>
+            </div>
+
+            <div style="margin-top: 14px;">
+                <h5 style="margin: 0 0 8px 0; font-size: 13px; color: #444;">Uploaded Documents</h5>
+                <div id="uploadedDocsList"></div>
             </div>
 
             <div id="embeddingDownload" class="download-item" style="display:none; margin-top: 20px;">

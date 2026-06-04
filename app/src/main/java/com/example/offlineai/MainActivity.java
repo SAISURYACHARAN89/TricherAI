@@ -1277,6 +1277,7 @@
                     super.onPageFinished(view, url);
                     Log.i(TAG, "WebView page finished loading");
                     notifyStatus();
+                    refreshUploadedDocsInWeb();
                 }
             });
 
@@ -1300,8 +1301,18 @@
                         if (!ragManager.isReady()) {
                             ragManager.init(this);
                         }
-                        ragManager.processDocument(this, uri);
-                        ui.post(() -> web.evaluateJavascript("if(window.onPdfSelected) window.onPdfSelected()", null));
+
+                        String displayName = uri.getLastPathSegment() != null ? uri.getLastPathSegment() : "document";
+                        sendDocumentUploadState("uploading", displayName, "Uploading and processing...");
+
+                        ragManager.processDocument(this, uri, (success, fileName, message) -> {
+                            if (success) {
+                                sendDocumentUploadState("uploaded", fileName, "Uploaded");
+                            } else {
+                                sendDocumentUploadState("error", fileName, message != null ? message : "Upload failed");
+                            }
+                            refreshUploadedDocsInWeb();
+                        });
                     }
                 } else if (filePathCallback != null) {
                     Uri[] results = (res == Activity.RESULT_OK && data != null) ? WebChromeClient.FileChooserParams.parseResult(res, data) : null;
@@ -1316,6 +1327,39 @@
         public class JSBridge {
             @JavascriptInterface
             public boolean isReady() { return sttReady && llmReady; }
+
+            @JavascriptInterface
+            public String getUploadedDocuments() {
+                try {
+                    if (ragManager == null) {
+                        return "[]";
+                    }
+                    JSONArray array = new JSONArray();
+                    for (String name : ragManager.getStoredDocumentNames(MainActivity.this)) {
+                        array.put(name);
+                    }
+                    return array.toString();
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to get uploaded documents", e);
+                    return "[]";
+                }
+            }
+
+            @JavascriptInterface
+            public void removeUploadedDocument(String fileName) {
+                if (fileName == null || fileName.trim().isEmpty()) return;
+                new Thread(() -> {
+                    try {
+                        if (ragManager != null) {
+                            ragManager.removeDocumentByName(MainActivity.this, fileName);
+                            refreshUploadedDocsInWeb();
+                        }
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to remove document: " + fileName, e);
+                    }
+                }).start();
+            }
+
             @JavascriptInterface
             public void testPauseResume() {
                 ui.post(() -> {
@@ -1750,11 +1794,15 @@
                         inConversation = true;
                         WakeWordService.pauseListening(MainActivity.this);
                         if (recorder == null) recorder = new Recorder(MainActivity.this);
+                        configureRecorderInputRouting();
                         recorder.setFilePath(new File(dataDir, WaveUtil.RECORDING_FILE).getAbsolutePath());
                         sttActive = true;
                         beepSingle();
                         recorder.start();
-                        Thread.sleep(5000);
+                        long startMs = System.currentTimeMillis();
+                        while (recorder.isInProgress() && System.currentTimeMillis() - startMs < 5000) {
+                            Thread.sleep(50);
+                        }
                         recorder.stop();
                         beepDouble();
 
@@ -1831,6 +1879,37 @@
                 try { latch.await(40, TimeUnit.SECONDS); } catch (Exception ignored) {}
                 return resultArr[0];
             }
+        }
+
+        private void refreshUploadedDocsInWeb() {
+            new Thread(() -> {
+                try {
+                    if (ragManager == null) return;
+                    List<String> names = ragManager.getStoredDocumentNames(MainActivity.this);
+                    JSONArray array = new JSONArray();
+                    for (String name : names) {
+                        array.put(name);
+                    }
+                    String docsJson = array.toString();
+                    ui.post(() -> web.evaluateJavascript(
+                            "if(window.onDocumentsLoaded) window.onDocumentsLoaded(" + docsJson + ")",
+                            null
+                    ));
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to refresh uploaded docs", e);
+                }
+            }).start();
+        }
+
+        private void sendDocumentUploadState(String state, String fileName, String message) {
+            String safeState = JSONObject.quote(state != null ? state : "unknown");
+            String safeFileName = JSONObject.quote(fileName != null ? fileName : "document");
+            String safeMessage = JSONObject.quote(message != null ? message : "");
+            ui.post(() -> web.evaluateJavascript(
+                    "if(window.onDocumentUploadState) window.onDocumentUploadState(" +
+                            safeState + "," + safeFileName + "," + safeMessage + ")",
+                    null
+            ));
         }
 
         /* ===================== AI FLOW LOGIC ===================== */
@@ -2371,20 +2450,38 @@
                     }
 
                     // Use RAG if context available
+                    String directDocumentAnswer = "";
                     String contextText = "";
                     if (ragManager != null && ragManager.isReady()) {
+                        directDocumentAnswer = ragManager.answerFromDocuments(processedQuestion);
                         contextText = ragManager.retrieve(processedQuestion, 5);
+                        if (contextText != null) {
+                            // Keep useful structure while trimming to fit the small local model window.
+                            contextText = contextText.trim();
+                            if (contextText.length() > 1200) {
+                                contextText = contextText.substring(0, 1200) + "...";
+                            }
+                        }
                         Log.i(TAG, "RAG Context retrieved (length: " + contextText.length() + ")");
                     }
 
-                    // Simple prompt without RAG
+                    if (directDocumentAnswer != null && !directDocumentAnswer.isEmpty()) {
+                        Log.i(TAG, "Answered directly from document match");
+                        beepSingle();
+                        processAndSpeakResponse(directDocumentAnswer);
+                        return;
+                    }
+
+                    // Compact prompt so the model sees more real document content.
                     String prompt;
                     if (contextText != null && !contextText.isEmpty()) {
-                        prompt = "<|im_start|>user\nContext:\n" + contextText + "\n\nQuestion: " + processedQuestion + "<|im_end|>\n" +
-                                "<|im_start|>assistant\n";
+                        prompt = "Use only the document context below to answer the question. " +
+                                "If the answer is not in the document, say that clearly.\n\n" +
+                                "Document context:\n" + contextText +
+                                "\n\nQuestion: " + processedQuestion +
+                                "\nAnswer briefly and factually.";
                     } else {
-                        prompt = "<|im_start|>user\n" + processedQuestion + "<|im_end|>\n" +
-                                "<|im_start|>assistant\n";
+                        prompt = "Question: " + processedQuestion + "\nAnswer briefly and factually.";
                     }
                     
                     Log.d(TAG, "Final Prompt sent to LLM: " + (prompt.length() > 500 ? prompt.substring(0, 500) + "..." : prompt));
@@ -2541,6 +2638,8 @@
                         recorder = new Recorder(this);
                     }
 
+                    configureRecorderInputRouting();
+
                     wav = new File(dataDir, "cmd_temp.wav");
                     recorder.setFilePath(wav.getAbsolutePath());
 
@@ -2549,7 +2648,10 @@
 
                     recorder.start();
 
-                    Thread.sleep(durationMs);
+                    long startMs = System.currentTimeMillis();
+                    while (recorder.isInProgress() && System.currentTimeMillis() - startMs < durationMs) {
+                        Thread.sleep(50);
+                    }
 
                     recorder.stop();
                     Log.i(TAG, "STT command recording stopped");
@@ -2586,6 +2688,18 @@
                 }
 
             }).start();
+        }
+
+        private void configureRecorderInputRouting() {
+            if (recorder == null) return;
+
+            boolean useBluetoothMic = false;
+            if (bluetoothAudioManager != null && bluetoothAudioManager.isBluetoothHeadsetConnected()) {
+                useBluetoothMic = bluetoothAudioManager.prepareBluetoothMicForRecording(1200);
+            }
+
+            recorder.setPreferBluetoothSco(useBluetoothMic);
+            Log.i(TAG, "Recorder input routing: useBluetoothMic=" + useBluetoothMic);
         }
 
 
@@ -3510,6 +3624,12 @@
         /* ===================== SUPPORT CLASSES ===================== */
 
         public static class GoogleLlmManager {
+            private static final int MODEL_MAX_TOKENS = 512;
+            private static final int RESERVED_OUTPUT_TOKENS = 160;
+            private static final int INPUT_TOKEN_BUDGET = MODEL_MAX_TOKENS - RESERVED_OUTPUT_TOKENS;
+            private static final int CHARS_PER_TOKEN_ESTIMATE = 3;
+            private static final int MAX_PROMPT_CHARS = INPUT_TOKEN_BUDGET * CHARS_PER_TOKEN_ESTIMATE;
+
             private LlmInference engine;
             private LlmInferenceSession session;
             private Context appContext;
@@ -3531,7 +3651,8 @@
                     LlmInference.LlmInferenceOptions opts = LlmInference.LlmInferenceOptions
                             .builder()
                             .setModelPath(path)
-                            .setMaxTokens(2048)
+                            // Lower max tokens to reduce latency and memory pressure.
+                            .setMaxTokens(MODEL_MAX_TOKENS)
                             .build();
                     engine = LlmInference.createFromOptions(ctx, opts);
                     return true;
@@ -3559,17 +3680,19 @@
                 }
 
                 try {
-                    // Qwen 0.5B on MediaPipe often has a hard limit of 512 or 1024 tokens.
-                    // Increased to 6000 chars to allow all Top 5 chunks (approx 1500 tokens).
-                    String truncatedPrompt = prompt.length() > 6000
-                            ? prompt.substring(0, 6000)
-                            : prompt;
+                    String truncatedPrompt = fitPromptToTokenBudget(prompt);
+                    if (truncatedPrompt.isEmpty()) {
+                        return "Please try a shorter question.";
+                    }
+                    Log.d("LLM_GEN", "Prompt chars=" + truncatedPrompt.length() +
+                            ", estTokens=" + estimateTokens(truncatedPrompt));
 
                     LlmInferenceSession.LlmInferenceSessionOptions sessionOpts =
                             LlmInferenceSession.LlmInferenceSessionOptions
                                     .builder()
-                                    .setTemperature(0.7f)
-                                    .setTopK(40)
+                                    // Lower sampling settings for faster, more deterministic output.
+                                    .setTemperature(0.3f)
+                                    .setTopK(20)
                                     .build();
 
                     session = LlmInferenceSession.createFromOptions(engine, sessionOpts);
@@ -3584,7 +3707,7 @@
                             response[0] = session.generateResponse();
                         } catch (Throwable e) {
                             Log.e("LLM_GEN", "Critical generation error", e);
-                            response[0] = "ERROR: Context too long or model error.";
+                            response[0] = "ERROR: model could not process this prompt.";
                         } finally {
                             latch.countDown();
                         }
@@ -3598,7 +3721,7 @@
 
                     if (response[0] != null && response[0].contains("ERROR:")) {
                         // Fallback: try without context if it crashed
-                        String minimalPrompt = extractUserQuestion(prompt);
+                        String minimalPrompt = buildMinimalPrompt(prompt);
                         if (minimalPrompt.length() < prompt.length()) {
                             return generate(minimalPrompt);
                         }
@@ -3610,6 +3733,36 @@
                     Log.e("LLM_GEN", "Generation failed", e);
                     return "Sorry, I encountered an error. Please try again with a shorter question.";
                 }
+            }
+
+            private int estimateTokens(String text) {
+                if (text == null || text.isEmpty()) return 0;
+                return (int) Math.ceil((double) text.length() / CHARS_PER_TOKEN_ESTIMATE);
+            }
+
+            private String fitPromptToTokenBudget(String prompt) {
+                if (prompt == null) return "";
+
+                String compact = prompt.replaceAll("\\s+", " ").trim();
+                if (compact.length() <= MAX_PROMPT_CHARS) {
+                    return compact;
+                }
+
+                int questionIndex = compact.indexOf("Question:");
+                if (questionIndex >= 0) {
+                    String questionPart = compact.substring(questionIndex).trim();
+                    if (questionPart.length() > MAX_PROMPT_CHARS) {
+                        return questionPart.substring(0, MAX_PROMPT_CHARS);
+                    }
+                    int roomForContext = MAX_PROMPT_CHARS - questionPart.length() - 1;
+                    String contextPart = compact.substring(0, questionIndex);
+                    if (roomForContext > 0 && contextPart.length() > roomForContext) {
+                        contextPart = contextPart.substring(0, roomForContext);
+                    }
+                    return (contextPart + " " + questionPart).trim();
+                }
+
+                return compact.substring(0, MAX_PROMPT_CHARS);
             }
 
             private String smartTruncate(String prompt, int maxWords) {
@@ -3669,6 +3822,16 @@
                 }
                 result.append("\nAssistant:");
                 return result.toString();
+            }
+
+            private String buildMinimalPrompt(String prompt) {
+                String question = extractUserQuestion(prompt);
+                if (question == null || question.isEmpty()) {
+                    question = "Please provide a concise answer.";
+                }
+                String minimal = "<|im_start|>user\n" + question +
+                        "\nAnswer briefly.\n<|im_end|>\n<|im_start|>assistant\n";
+                return fitPromptToTokenBudget(minimal);
             }
         }
     }

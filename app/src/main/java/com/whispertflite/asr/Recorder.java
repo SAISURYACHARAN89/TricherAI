@@ -37,6 +37,10 @@ public class Recorder {
     public static final String ACTION_RECORD = "Record";
     public static final String MSG_RECORDING = "Recording...";
     public static final String MSG_RECORDING_DONE = "Recording done...!";
+    // Silence detection parameters for auto-stop (tuned for 16kHz PCM16 mono).
+    private static final int SILENCE_THRESHOLD = 700; // avg abs amplitude
+    private static final int SILENCE_DURATION_MS = 1200;
+    private static final int MIN_SPEECH_MS = 300;
 
     private final Context mContext;
     private final AtomicBoolean mInProgress = new AtomicBoolean(false);
@@ -46,8 +50,10 @@ public class Recorder {
     private final Lock lock = new ReentrantLock();
     private final Condition hasTask = lock.newCondition();
     private final Object fileSavedLock = new Object(); // Lock object for wait/notify
+    private volatile boolean fileSaved = false;
 
     private volatile boolean shouldStartRecording = false;
+    private volatile boolean preferBluetoothSco = false;
 
     private final Thread workerThread;
 
@@ -81,13 +87,19 @@ public class Recorder {
         }
     }
 
+    public void setPreferBluetoothSco(boolean preferBluetoothSco) {
+        this.preferBluetoothSco = preferBluetoothSco;
+    }
+
     public void stop() {
         mInProgress.set(false);
 
         // Wait for the recording thread to finish
         synchronized (fileSavedLock) {
             try {
-                fileSavedLock.wait(); // Wait until notified by the recording thread
+                while (!fileSaved) {
+                    fileSavedLock.wait(); // Wait until notified by the recording thread
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt(); // Restore interrupted status
             }
@@ -136,9 +148,14 @@ public class Recorder {
     }
 
     private void recordAudio() {
+        fileSaved = false;
         if (ActivityCompat.checkSelfPermission(mContext, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             Log.d(TAG, "AudioRecord permission is not granted");
             sendUpdate("Permission not granted for recording");
+            synchronized (fileSavedLock) {
+                fileSaved = true;
+                fileSavedLock.notify();
+            }
             return;
         }
 
@@ -149,11 +166,55 @@ public class Recorder {
         int sampleRateInHz = 16000;
         int channelConfig = AudioFormat.CHANNEL_IN_MONO;
         int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
-        int audioSource = MediaRecorder.AudioSource.MIC;
+        int[] sourceCandidates = preferBluetoothSco
+                ? new int[]{MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC}
+                : new int[]{MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC};
 
         int bufferSize = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat);
-        AudioRecord audioRecord = new AudioRecord(audioSource, sampleRateInHz, channelConfig, audioFormat, bufferSize);
-        audioRecord.startRecording();
+        if (bufferSize <= 0) {
+            Log.e(TAG, "Invalid buffer size from AudioRecord: " + bufferSize);
+            sendUpdate("Unable to start microphone input");
+            synchronized (fileSavedLock) {
+                fileSaved = true;
+                fileSavedLock.notify();
+            }
+            return;
+        }
+
+        AudioRecord audioRecord = null;
+        int selectedSource = -1;
+        for (int source : sourceCandidates) {
+            try {
+                AudioRecord candidate = new AudioRecord(source, sampleRateInHz, channelConfig, audioFormat, bufferSize);
+                if (candidate.getState() != AudioRecord.STATE_INITIALIZED) {
+                    candidate.release();
+                    continue;
+                }
+
+                candidate.startRecording();
+                if (candidate.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+                    audioRecord = candidate;
+                    selectedSource = source;
+                    break;
+                }
+
+                candidate.release();
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to start AudioRecord with source=" + source, e);
+            }
+        }
+
+        if (audioRecord == null) {
+            Log.e(TAG, "Failed to initialize recording with all audio sources");
+            sendUpdate("Microphone is unavailable");
+            synchronized (fileSavedLock) {
+                fileSaved = true;
+                fileSavedLock.notify();
+            }
+            return;
+        }
+
+        Log.i(TAG, "Recording started with source=" + selectedSource + ", preferBluetoothSco=" + preferBluetoothSco);
 
         // Calculate maximum byte counts for 30 seconds (for saving)
         int bytesForThirtySeconds = sampleRateInHz * bytesPerSample * channels * 30;
@@ -165,12 +226,36 @@ public class Recorder {
         byte[] audioData = new byte[bufferSize];
         int totalBytesRead = 0;
 
+        long totalSamplesRead = 0;
+        long silentSamples = 0;
+        long silenceSamplesThreshold = (long) sampleRateInHz * SILENCE_DURATION_MS / 1000;
+        long minSpeechSamples = (long) sampleRateInHz * MIN_SPEECH_MS / 1000;
+
         while (mInProgress.get() && totalBytesRead < bytesForThirtySeconds) {
             int bytesRead = audioRecord.read(audioData, 0, bufferSize);
             if (bytesRead > 0) {
                 outputBuffer.write(audioData, 0, bytesRead);  // Save all bytes read up to 30 seconds
                 realtimeBuffer.write(audioData, 0, bytesRead); // Accumulate real-time audio data
                 totalBytesRead += bytesRead;
+
+                int sampleCount = bytesRead / 2;
+                totalSamplesRead += sampleCount;
+                long sumAbs = 0;
+                for (int i = 0; i + 1 < bytesRead; i += 2) {
+                    short sample = (short) ((audioData[i] & 0xFF) | (audioData[i + 1] << 8));
+                    sumAbs += Math.abs(sample);
+                }
+                int avgAbs = sampleCount > 0 ? (int) (sumAbs / sampleCount) : 0;
+                if (avgAbs < SILENCE_THRESHOLD) {
+                    silentSamples += sampleCount;
+                } else {
+                    silentSamples = 0;
+                }
+
+                if (totalSamplesRead >= minSpeechSamples && silentSamples >= silenceSamplesThreshold) {
+                    mInProgress.set(false); // Auto-stop on sustained silence
+                    break;
+                }
 
                 // Check if realtimeBuffer has more than 3 seconds of data
                 if (realtimeBuffer.size() >= bytesForThreeSeconds) {
@@ -184,7 +269,9 @@ public class Recorder {
             }
         }
 
-        audioRecord.stop();
+        if (audioRecord.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+            audioRecord.stop();
+        }
         audioRecord.release();
 
         // Save recorded audio data to file (up to 30 seconds)
@@ -193,6 +280,7 @@ public class Recorder {
 
         // Notify the waiting thread that recording is complete
         synchronized (fileSavedLock) {
+            fileSaved = true;
             fileSavedLock.notify(); // Notify that recording is finished
         }
 

@@ -131,6 +131,30 @@ public class BluetoothAudioManager {
         }
     }
 
+    public boolean prepareBluetoothMicForRecording(long timeoutMs) {
+        if (!isBluetoothHeadsetConnected()) {
+            return false;
+        }
+
+        switchToBluetooth();
+        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        while (System.currentTimeMillis() < deadline) {
+            if (isBluetoothScoActive) {
+                return true;
+            }
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        Log.w(TAG, "Bluetooth SCO not ready before timeout, fallback to phone mic");
+        switchToPhone();
+        return false;
+    }
+
     public void switchToPhone() {
         Log.i(TAG, "Switching to phone audio");
 
