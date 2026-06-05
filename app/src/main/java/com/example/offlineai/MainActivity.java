@@ -60,6 +60,7 @@
 
         private static final String TAG = "OfflineAI";
         private static final int PERM_REQUEST_MIC = 777;
+        //sas
         private static final int REQ_FILE_CHOOSER = 1001;
 
         private static final String DEFAULT_LLM_URL = "https://huggingface.co/litert-community/Qwen2.5-0.5B-Instruct/resolve/main/Qwen2.5-0.5B-Instruct_multi-prefill-seq_q8_ekv1280.task";
