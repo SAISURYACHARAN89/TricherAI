@@ -331,8 +331,8 @@
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Segment response received: " + response);
 
-                                // 🔥 FIX: Add beep to acknowledge user response
-                                MainActivity.this.beepSingle();
+                                // 🔥 FIX: Add double beep to acknowledge user response (matches AI mode)
+                                MainActivity.this.beepDouble();
 
                                 ui.post(() -> {
                                     boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
@@ -378,8 +378,8 @@
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Note response received: " + response);
 
-                                // 🔥 FIX: Add beep to acknowledge user response
-                                MainActivity.this.beepSingle();
+                                // 🔥 FIX: Add double beep to acknowledge user response (matches AI mode)
+                                MainActivity.this.beepDouble();
 
                                 boolean wantsToStudy = response.contains("yes");
 
@@ -400,17 +400,17 @@
             }
         }
 
-        // Study Mode Timeout Methods
-        private void startStudyModeTimeout() {
-            studyModeTimeoutHandler.removeCallbacksAndMessages(null);
-            studyModeTimeoutHandler.postDelayed(() -> {
-                if (studyModeActive) {
-                    Log.w(TAG, "Study mode timeout - resetting");
-                    endStudyMode();
-                    speak("Study mode timed out. Returning to normal mode.");
-                }
-            }, 60000); // 60 second timeout
-        }
+    // Study Mode Timeout Methods
+    private void startStudyModeTimeout() {
+        studyModeTimeoutHandler.removeCallbacksAndMessages(null);
+        studyModeTimeoutHandler.postDelayed(() -> {
+            if (studyModeActive) {
+                Log.w(TAG, "Study mode timeout - resetting");
+                endStudyMode();
+                speak("Study mode timed out. Returning to normal mode.");
+            }
+        }, 300000); // 5 minutes timeout (increased from 60 seconds for long answers)
+    }
 
         private void resetStudyModeTimeout() {
             studyModeTimeoutHandler.removeCallbacksAndMessages(null);
@@ -422,14 +422,33 @@
         public void endStudyMode() {
             ui.post(() -> {
                 Log.i(TAG, "Ending study mode");
+                // Hard reset all study-mode related flags so that
+                // subsequent wake word + commands work reliably
                 studyModeActive = false;
                 studyModeSession = null;
+
+                // Make sure we are not considered "in conversation"
+                // after study mode finishes
                 inConversation = false;
 
-                speak("Study mode completed. Returning to normal mode.");
+                // Also ensure TTS / STT state is fully cleared so the
+                // next flow starts from a clean baseline
+                ttsSpeaking = false;
+                sttActive = false;
+                responsePaused = false;
 
+                // speak("Study mode completed. Returning to normal mode.");
+                
+                // Use safeSpeak or direct tts.speak to avoid "utt" ID that triggers STT
+                if (tts != null && ttsReady) {
+                    requestTtsAudioFocus();
+                    tts.speak("Study mode completed. Returning to normal mode.", TextToSpeech.QUEUE_FLUSH, null, "study_exit_msg");
+                }
+
+                // Clear any pending study-mode timeouts
                 studyModeTimeoutHandler.removeCallbacksAndMessages(null);
 
+                // Re-enable wake word listening in the default WAKE mode
                 WakeWordService.resumeWakeMode(MainActivity.this);
             });
         }
@@ -1162,18 +1181,21 @@
                         ", STT Active: " + sttActive +
                         ", In Conversation: " + inConversation);
 
-                // 🔥 FIX: Only block if TTS is actually speaking or STT is active
+                // 🔥 FIX: Allow wake word even during conversation (for interruptions)
                 if (ttsSpeaking) {
-                    Log.i(TAG, "Not starting STT - TTS speaking or STT active");
-                    return;
-                }
-                if (sttActive) {
-                    Log.i(TAG, "Not starting STT - STT already active");
-                    return;
+                    Log.i(TAG, "Interrupting TTS due to wake word");
+                    safeStopTTS();
                 }
 
-                // 🔥 FIX: Allow wake word even during conversation (for interruptions)
-                toneGen.stopTone();
+                if (sttActive) {
+                    Log.i(TAG, "STT already active, re-triggering listening...");
+                }
+
+                if (bluetoothAudioManager != null) {
+                    bluetoothAudioManager.stopBeep();
+                } else if (toneGen != null) {
+                    toneGen.stopTone();
+                }
                 beepSingle();
 
                 ui.post(() -> Toast.makeText(MainActivity.this, "Listening…", Toast.LENGTH_SHORT).show());
@@ -1239,6 +1261,13 @@
             currentChunkIndex = 0;
             responseChunks.clear();
             lastGeneratedResponse = "";
+            
+            // 🔥 Reset audio mode when conversation truly ends
+            AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            am.setMode(AudioManager.MODE_NORMAL);
+            if (bluetoothAudioManager != null) {
+                bluetoothAudioManager.switchToPhone();
+            }
         }
         private void armStudyModeCommandListening(int token) {
             if (!studyModeActive) return;
@@ -1463,6 +1492,7 @@
             public void startCall() {
                 if (callActive) return;
                 callActive = true;
+                inConversation = true; // NEW: Start conversation state
 
                 MainActivity.this.resetConversationState();
                 startWakeService();
@@ -1797,10 +1827,29 @@
                         configureRecorderInputRouting();
                         recorder.setFilePath(new File(dataDir, WaveUtil.RECORDING_FILE).getAbsolutePath());
                         sttActive = true;
+                        
+                        // NEW: Interruption support
+                        recorder.setListener(new Recorder.RecorderListener() {
+                            @Override public void onUpdateReceived(String m) {}
+                            @Override public void onDataReceived(float[] s) {}
+                            @Override
+                            public void onSpeechDetected() {
+                                Log.i(TAG, "onSpeechDetected: ttsSpeaking=" + ttsSpeaking);
+                                if (ttsSpeaking) {
+                                    Log.i(TAG, "Speech detected while AI speaking! Interrupting...");
+                                    safeStopTTS();
+                                    
+                                    // Give a small beep to acknowledge interruption
+                                    beepSingle();
+                                }
+                            }
+                        });
+
                         beepSingle();
                         recorder.start();
                         long startMs = System.currentTimeMillis();
-                        while (recorder.isInProgress() && System.currentTimeMillis() - startMs < 5000) {
+                        // Increased from 5s to 30s to allow long questions
+                        while (recorder.isInProgress() && System.currentTimeMillis() - startMs < 30000) {
                             Thread.sleep(50);
                         }
                         recorder.stop();
@@ -1826,8 +1875,24 @@
                             resultArr[0] = "Error: Transcription timed out. Please try a shorter question.";
                         }
 
+                        // Resume background listening ONLY if not in continuous flow
+                        if (!inConversation) {
+                            WakeWordService.resumeWakeMode(MainActivity.this);
+                        }
+
                         if (resultArr[0] != null && !resultArr[0].isEmpty()) {
                             String userText = resultArr[0].trim();
+                            
+                            // If user is silent or says very little, maybe end continuous mode
+                            if (userText.length() < 2) {
+                                Log.i(TAG, "User silent, ending continuous conversation");
+                                inConversation = false;
+                                releaseTtsAudioFocus();
+                                WakeWordService.resumeWakeMode(MainActivity.this);
+                                resultArr[0] = "";
+                                return;
+                            }
+
                             Log.i(TAG, "Study mode command received, before");
 
                             // Check if user said "study mode"
@@ -1989,19 +2054,27 @@
         private void setupMainTTSListener() {
             if (tts == null) return;
 
-            tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                @Override
-                public void onStart(String id) {
-                    ttsSpeaking = true;
-                    Log.d(TAG, "Main TTS started utterance: " + id);
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
 
-                    if (id.startsWith("study_")) {
-                        Log.i(TAG, "Study mode TTS started: " + id);
+                    @Override
+                    public void onStart(String id) {
+                        ttsSpeaking = true;
+                        Log.d(TAG, "TTS started utterance: " + id);
+
+                        if (id.startsWith("study_")) {
+                            Log.i(TAG, "Study mode TTS started: " + id);
+                            // 🔥 CRITICAL FIX: Reset timeout when TTS starts speaking in study mode
+                            resetStudyModeTimeout();
+                        }
                     }
-                }
 
-                @Override
-                public void onDone(String id) {
+                    @Override
+                    public void onDone(String id) {
+                    // id check to avoid race conditions if tts.stop() was called
+                    if (!"utt".equals(id) && !id.startsWith("chunk_") && !id.startsWith("study_")) {
+                         Log.d(TAG, "Unexpected onDone ID: " + id);
+                    }
+
                     ttsSpeaking = false;
                     Log.d(TAG, "Main TTS done utterance: " + id);
 
@@ -2023,7 +2096,7 @@
                     }
 
                     // 🔥 IMPORTANT: DON'T release audio focus during gaps if we're in conversation
-                    if (!studyModeActive && !inConversation) {
+                    if (!studyModeActive && !inConversation && !id.equals("utt")) {
                         releaseTtsAudioFocus();
                     }
 
@@ -2096,14 +2169,24 @@
                             Log.i(TAG, "Finished all normal mode chunks");
                             ui.postDelayed(() -> {
                                 beepSingle();
-                                inConversation = false;
-                                releaseTtsAudioFocus();
-                                WakeWordService.resumeWakeMode(MainActivity.this);
+                                startSTTFromWake();
                             }, 500);
                             return;
                         }
 
                         armNormalModeGapListening();
+                        return;
+                    }
+
+                    // 🔥 Continuous flow for normal single-chunk speech
+                    if (id.equals("utt") && !studyModeActive) {
+                        ui.postDelayed(() -> {
+                            if (!ttsSpeaking) {
+                                Log.i(TAG, "AI finished speaking (utt), waiting for user response...");
+                                beepSingle();
+                                startSTTFromWake();
+                            }
+                        }, 500);
                         return;
                     }
 
@@ -2133,7 +2216,7 @@
                     }
 
                     // Final cleanup
-                    if (!studyModeActive && !ttsSpeaking && !id.startsWith("chunk_")) {
+                    if (!studyModeActive && !ttsSpeaking && !id.startsWith("chunk_") && !id.equals("utt") && !id.equals("study_exit_msg")) {
                         ui.postDelayed(() -> {
                             if (!ttsSpeaking) {
                                 inConversation = false;
@@ -2165,8 +2248,8 @@
         private void requestTtsAudioFocus() {
             AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
 
-            // Set correct audio mode based on Bluetooth state
-            if (bluetoothAudioManager != null && bluetoothAudioManager.isBluetoothScoActive()) {
+            // Maintain IN_COMMUNICATION during conversation to prevent Bluetooth SCO flapping
+            if (bluetoothAudioManager != null && bluetoothAudioManager.isBluetoothHeadsetConnected()) {
                 am.setMode(AudioManager.MODE_IN_COMMUNICATION);
             } else {
                 am.setMode(AudioManager.MODE_NORMAL);
@@ -2186,6 +2269,11 @@
         }
 
         private void releaseTtsAudioFocus() {
+            if (inConversation || studyModeActive) {
+                Log.i(TAG, "Maintaining audio focus/mode during active session");
+                return;
+            }
+
             AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
             int result = am.abandonAudioFocus(null);
             Log.i(TAG, "Audio focus release result: " + result);
@@ -2220,22 +2308,25 @@
             playStudyNextChunk(noteId);
         }
 
-        private void playStudyNextChunk(String noteId) {
-            // 🔥 FIX: Early return if paused or not in study mode
-            if (responsePaused || !studyModeActive || responseChunks == null || responseChunks.isEmpty()) {
-                Log.i(TAG, "Cannot play study chunk - paused=" + responsePaused +
-                       ", studyMode=" + studyModeActive +
-                       ", chunks=" + (responseChunks == null ? "null" : responseChunks.size()));
-                return;
-            }
+    public void playStudyNextChunk(String noteId) {
+        // 🔥 FIX: Early return if paused or not in study mode
+        if (responsePaused || !studyModeActive || responseChunks == null || responseChunks.isEmpty()) {
+            Log.i(TAG, "Cannot play study chunk - paused=" + responsePaused +
+                   ", studyMode=" + studyModeActive +
+                   ", chunks=" + (responseChunks == null ? "null" : responseChunks.size()));
+            return;
+        }
 
-            // 🔥 FIX: Null check for noteId
-            if (noteId == null) {
-                Log.w(TAG, "Cannot play study chunk - noteId is null");
-                return;
-            }
+        // 🔥 FIX: Null check for noteId
+        if (noteId == null) {
+            Log.w(TAG, "Cannot play study chunk - noteId is null");
+            return;
+        }
 
-            if (currentChunkIndex < responseChunks.size()) {
+        // 🔥 CRITICAL FIX: Reset timeout to prevent timeout during long answers
+        resetStudyModeTimeout();
+
+        if (currentChunkIndex < responseChunks.size()) {
                 String text = responseChunks.get(currentChunkIndex);
                 String utteranceId = "study_content_" + noteId + "_chunk_" + currentChunkIndex;
 
@@ -2285,7 +2376,6 @@
                 debugAudioState("speakForStudyMode-before");
 
                 AudioManager am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-                am.setMode(AudioManager.MODE_NORMAL);
 
                 // Check TTS state first
                 if (tts == null) {
@@ -2885,203 +2975,7 @@
                     Log.i(TAG, "TTS initialized successfully");
 
                     // Set up the utterance listener
-                    tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-
-                        @Override
-                        public void onStart(String id) {
-                            ttsSpeaking = true;
-                            Log.d(TAG, "TTS started utterance: " + id);
-
-                            if (id.startsWith("study_")) {
-                                Log.i(TAG, "Study mode TTS started: " + id);
-                            }
-                        }
-
-                        @Override
-                        public void onDone(String id) {
-                            ttsSpeaking = false;
-                            Log.d(TAG, "TTS done utterance: " + id);
-                            if ("conf".equals(id)) {
-                                Log.i(TAG, "Confirmation utterance done - handled in speakConfirmation");
-                                return;
-                            }
-                            if (id.equals("utt") && responsePaused) {
-                                Log.i(TAG, "✅ 'Paused.' message finished, setting up command listening");
-                                ui.postDelayed(() -> listenForSingleCommandAfterPause(), 500);
-                                return;
-                            }
-                            // For other control messages during AutoPause mode, don't do anything special
-                            // Normal messages like "I didn't catch that" should proceed normally
-                            if (responsePaused) {
-                                Log.i(TAG, "Paused — skipping gap STT completely");
-                                return; // 🔥 Don't do anything if paused
-                            }
-
-                            // 🔥 IMPORTANT: DON'T release audio focus during gaps if we're in conversation
-                            if (!studyModeActive && !inConversation) {
-                                releaseTtsAudioFocus();
-                            }
-
-                            if ("repeat".equals(id)) {
-                                isRepeating = false;
-                                beepSingle();
-                                WakeWordService.unlockAfterTTS(MainActivity.this, true);
-                                return;
-                            }
-
-                            if (isRepeating) {
-                                return;
-                            }
-
-                            // 🔥 UPDATED: Handle study mode chunks with autoPause
-                            if (id.startsWith("study_content_") && id.contains("_chunk_") && autoPause && !responsePaused) {
-                                Log.i(TAG, "Study mode chunk completed: " + id);
-
-                                String[] parts = id.split("_");
-                                String noteId = parts.length > 2 ? parts[2] : null;
-
-                                // Check if we're at the end
-                                if (currentChunkIndex >= responseChunks.size()) {
-                                    Log.i(TAG, "Finished all study content chunks for note: " + noteId);
-
-                                    // Move to next note after a delay
-                                    ui.postDelayed(() -> {
-                                        if (studyModeActive && studyModeSession != null) {
-                                            Log.i(TAG, "Auto-advancing to next note after finishing chunks");
-
-                                            studyModeSession.currentNoteIndex++;
-                                            if (studyModeSession.currentNoteIndex <
-                                                    studyModeSession.segments.get(studyModeSession.currentSegmentIndex).notes.size()) {
-                                                studyModeSession.startNoteSelection(
-                                                        studyModeSession.segments.get(studyModeSession.currentSegmentIndex)
-                                                );
-                                            } else {
-                                                studyModeSession.currentSegmentIndex++;
-                                                studyModeSession.inNoteSelection = false;
-                                                studyModeSession.nextSegment();
-                                            }
-                                        }
-                                    }, 500);
-                                    return;
-                                }
-
-                                // Play next chunk after pause
-                                // 🎧 Listen FIRST
-                                // 🔑 Create a new gap token
-                                int myToken = ++studyGapToken;
-
-                                // 🔥 ensure mic is free
-                                safeStopTTS();
-                                ttsSpeaking = false;
-
-                                // 🎧 LISTEN DURING GAP
-                                armStudyModeCommandListening(myToken);
-
-                                // ▶️ continue only if silence
-                                ui.postDelayed(() -> {
-                                    if (!studyModeActive) return;
-                                    if (responsePaused) return;
-                                    if (studyGapToken != myToken) return;
-
-                                    // 🔥 FIX: Add beep to signal gap closing and content resuming
-                                    beepSingle();
-                                    playStudyNextChunk(noteId);
-                                }, pauseGap * 1000);
-
-                                return;
-                            }
-
-                            // 🔥 NEW: Handle normal mode chunks with gap listening
-                            if (id.startsWith("chunk_") && autoPause && !responsePaused && inConversation) {
-                                Log.i(TAG, "Normal mode chunk completed: " + id + ", chunk " +
-                                        currentChunkIndex + " of " + responseChunks.size());
-
-                                // Check if we're at the end
-                                if (currentChunkIndex >= responseChunks.size()) {
-                                    Log.i(TAG, "Finished all normal mode chunks");
-                                    ui.postDelayed(() -> {
-                                        beepSingle();
-                                        inConversation = false;
-                                        releaseTtsAudioFocus(); // 🔥 Release audio focus at the END
-                                        WakeWordService.resumeWakeMode(MainActivity.this);
-                                    }, 500);
-                                    return;
-                                }
-
-                                // 🎧 LISTEN FOR COMMANDS DURING GAP (NORMAL MODE)
-                                armNormalModeGapListening();
-
-                                // ▶️ Schedule next chunk only if no command is detected
-
-                                return;
-                            }
-
-                            // Handle study mode callbacks (non-chunked)
-                            if (id.startsWith("study_") && !id.contains("_chunk_")) {
-                                Log.i(TAG, "Study mode TTS completed: " + id);
-
-                                ui.postDelayed(() -> {
-                                    if (studyModeActive) {
-                                        String[] parts = id.split("_");
-                                        if (parts.length > 1) {
-                                            String callbackType = parts[1];
-                                            String extraData = parts.length > 2 ? parts[2] : null;
-
-                                            Log.i(TAG, "Processing study callback: " + callbackType +
-                                                    ", extra: " + extraData + ", session: " + (studyModeSession != null));
-
-                                            // Direct handling for "start" callback
-                                            if ("start".equals(callbackType)) {
-                                                Log.i(TAG, "Starting first segment after start message");
-                                                if (studyModeSession != null) {
-                                                    studyModeSession.nextSegment();
-                                                }
-                                            } else {
-                                                // Use the callback method for other types
-                                                handleStudyModeCallback(callbackType, extraData);
-                                            }
-                                        }
-                                    } else {
-                                        Log.w(TAG, "Study mode not active, ignoring callback");
-                                    }
-                                }, 300);
-                                return;
-                            }
-
-                            // Final cleanup if not in study mode and TTS is done
-                            if (!studyModeActive && !ttsSpeaking && !id.startsWith("chunk_")) {
-                                // Small delay before ending conversation
-                                ui.postDelayed(() -> {
-                                    if (!ttsSpeaking) {
-                                        inConversation = false;
-                                        releaseTtsAudioFocus(); // 🔥 Release audio focus at the END
-                                        WakeWordService.resumeWakeMode(MainActivity.this);
-                                    }
-                                }, 500);
-                            }
-                        }
-
-                        @Override
-                        public void onError(String id) {
-                            ttsSpeaking = false;
-                            Log.e(TAG, "TTS error utterance: " + id);
-
-                            // Release audio focus
-                            if (!studyModeActive) {
-                                releaseTtsAudioFocus();
-                            }
-
-
-                            if (id.startsWith("study_")) {
-                                Log.e(TAG, "Study mode TTS error");
-                            }
-
-                            if (!studyModeActive) {
-                                inConversation = false;
-                                WakeWordService.resumeWakeMode(MainActivity.this);
-                            }
-                        }
-                    });
+                    setupMainTTSListener();
 
                     // Check if we have pending speech
                     if (pendingTtsText != null) {
@@ -3446,7 +3340,9 @@
             }
 
             if (tts != null && ttsReady) {
-                safeSpeak(txt);
+                // Ensure we use the correct utterance ID for normal speech
+                // so setupMainTTSListener can catch onDone and trigger next STT
+                tts.speak(txt, TextToSpeech.QUEUE_FLUSH, null, "utt");
             } else {
                 Log.w(TAG, "TTS not ready, storing for later");
                 pendingTtsText = txt;
@@ -3590,17 +3486,31 @@
             ui.post(() -> web.evaluateJavascript("if(window.onNativeStatus) window.onNativeStatus(" + sttReady + "," + llmReady + ")", null));
         }
 
-        private void beepOnce() { toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 120); }
-        private void beepSingle() { if (studyModeActive) return;
-            toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 150); }
-        private void beepDouble() {
-            if (studyModeActive) return;
+    private void beepSingle() {
+        if (bluetoothAudioManager != null) {
+            bluetoothAudioManager.playBeep(ToneGenerator.TONE_PROP_BEEP, 150);
+        } else if (toneGen != null) {
+            toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 150);
+        }
+    }
 
+    private void beepDouble() {
+        if (bluetoothAudioManager != null) {
+            bluetoothAudioManager.playBeep(ToneGenerator.TONE_PROP_BEEP, 100);
+            ui.postDelayed(() -> bluetoothAudioManager.playBeep(ToneGenerator.TONE_PROP_BEEP, 100), 200);
+        } else if (toneGen != null) {
             toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 100);
             ui.postDelayed(() -> toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 100), 200);
         }
+    }
 
         private void startSTTFromWake() {
+            inConversation = true; // Mark as in conversation for continuous flow
+            sttActive = true; // Ensure STT is marked active so interruptions work
+            
+            // Stop any background wake word listening during active STT
+            WakeWordService.pauseListening(MainActivity.this);
+
             ui.post(() -> web.evaluateJavascript("if(window.startVoiceFromWake) window.startVoiceFromWake()", null));
         }
 

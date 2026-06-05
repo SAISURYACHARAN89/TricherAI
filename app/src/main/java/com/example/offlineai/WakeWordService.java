@@ -174,6 +174,7 @@ public class WakeWordService extends Service {
     private void startListening() {
         listenThread = new Thread(() -> {
             try {
+                setupAudioForWakeWord(); // Ensure audio is setup before starting recorder
                 startRecorderIfNeeded();
                 byte[] buffer = new byte[4096];
                 while (running) {
@@ -221,8 +222,15 @@ public class WakeWordService extends Service {
         // Check for Bluetooth and set mode accordingly
         BluetoothAdapter btAdapter = BluetoothAdapter.getDefaultAdapter();
         if (btAdapter != null && btAdapter.isEnabled()) {
-            // Could add Bluetooth headset check here
-            am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+            // Check if headset is connected (simplified)
+            if (am.isBluetoothScoAvailableOffCall()) {
+                Log.i(TAG, "Bluetooth SCO available, setting mode for communication");
+                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                am.startBluetoothSco();
+                am.setBluetoothScoOn(true);
+            } else {
+                am.setMode(AudioManager.MODE_NORMAL);
+            }
         } else {
             am.setMode(AudioManager.MODE_NORMAL);
         }
@@ -234,8 +242,30 @@ public class WakeWordService extends Service {
     private void startRecorderIfNeeded() {
         if (recorder != null) return;
         int buf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        recorder = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, buf * 4);
-        if (recorder.getState() == AudioRecord.STATE_INITIALIZED) recorder.startRecording();
+        
+        // Priority: VOICE_RECOGNITION > VOICE_COMMUNICATION > MIC
+        int[] sources = {
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+            MediaRecorder.AudioSource.MIC
+        };
+
+        for (int source : sources) {
+            try {
+                recorder = new AudioRecord(source, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, buf * 4);
+                if (recorder.getState() == AudioRecord.STATE_INITIALIZED) {
+                    Log.i(TAG, "WakeWord recorder started with source: " + source);
+                    recorder.startRecording();
+                    return;
+                }
+                recorder.release();
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to init recorder with source: " + source, e);
+            }
+        }
+        
+        recorder = null;
+        Log.e(TAG, "Failed to initialize WakeWord recorder with all sources");
     }
 
     private void stopRecorder() {

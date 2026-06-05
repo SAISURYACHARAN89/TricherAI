@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace "com.psais.offlineai"
+    namespace "com.example.offlineai"
     compileSdk 36
 
     defaultConfig {
-        applicationId "com.psais.offlineai"
+        applicationId "com.example.offlineai"
         minSdk 26
         targetSdk 36
         versionCode 6

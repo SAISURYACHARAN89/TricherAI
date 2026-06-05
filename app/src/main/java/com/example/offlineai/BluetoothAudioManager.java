@@ -7,8 +7,13 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
+import android.media.ToneGenerator;
+import android.os.Build;
 import android.util.Log;
+
+import java.util.List;
 
 public class BluetoothAudioManager {
     private static final String TAG = "BluetoothAudio";
@@ -19,6 +24,9 @@ public class BluetoothAudioManager {
     private BluetoothHeadset bluetoothHeadset;
     private boolean isBluetoothScoActive = false;
     private boolean isInitialized = false;
+
+    private ToneGenerator scoToneGen;
+    private ToneGenerator musicToneGen;
 
     private final BroadcastReceiver bluetoothReceiver = new BroadcastReceiver() {
         @Override
@@ -82,6 +90,31 @@ public class BluetoothAudioManager {
         this.context = context;
         this.audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
         this.bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+        
+        try {
+            scoToneGen = new ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80);
+            musicToneGen = new ToneGenerator(AudioManager.STREAM_MUSIC, 80);
+        } catch (Exception e) {
+            Log.e(TAG, "Error creating ToneGenerators", e);
+        }
+    }
+
+    public void playBeep(int toneType, int durationMs) {
+        if (isBluetoothHeadsetConnected() && (isBluetoothScoActive || audioManager.isBluetoothScoOn())) {
+            if (scoToneGen != null) {
+                scoToneGen.startTone(toneType, durationMs);
+                return;
+            }
+        }
+        
+        if (musicToneGen != null) {
+            musicToneGen.startTone(toneType, durationMs);
+        }
+    }
+
+    public void stopBeep() {
+        if (scoToneGen != null) scoToneGen.stopTone();
+        if (musicToneGen != null) musicToneGen.stopTone();
     }
 
     public void initialize() {
@@ -113,19 +146,39 @@ public class BluetoothAudioManager {
         }
 
         try {
-            // Stop any existing SCO connection
-            audioManager.stopBluetoothSco();
-            audioManager.setBluetoothScoOn(false);
+            // Android 12+ (API 31+) uses setCommunicationDevice
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                AudioDeviceInfo bluetoothHeadsetDevice = null;
+                List<AudioDeviceInfo> devices = audioManager.getAvailableCommunicationDevices();
+                for (AudioDeviceInfo device : devices) {
+                    int type = device.getType();
+                    // 26 is AudioDeviceInfo.TYPE_BLUETOOTH_HEADSET
+                    if (type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || type == 26) {
+                        bluetoothHeadsetDevice = device;
+                        break;
+                    }
+                }
 
-            // Start new SCO connection
-            audioManager.startBluetoothSco();
-            audioManager.setBluetoothScoOn(true);
+                if (bluetoothHeadsetDevice != null) {
+                    boolean result = audioManager.setCommunicationDevice(bluetoothHeadsetDevice);
+                    Log.i(TAG, "setCommunicationDevice result: " + result);
+                }
+            }
+
+            // Also keep SCO-based routing for older devices and fallback
+            if (!audioManager.isBluetoothScoOn()) {
+                audioManager.startBluetoothSco();
+                audioManager.setBluetoothScoOn(true);
+                Log.i(TAG, "Bluetooth SCO started");
+            } else {
+                Log.i(TAG, "Bluetooth SCO already on");
+            }
 
             // Set audio mode for communication
             audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
             audioManager.setSpeakerphoneOn(false);
 
-            Log.i(TAG, "Switched to Bluetooth audio");
+            Log.i(TAG, "Switched to Bluetooth audio (Mode: " + audioManager.getMode() + ")");
         } catch (Exception e) {
             Log.e(TAG, "Error switching to Bluetooth audio", e);
         }
@@ -136,22 +189,42 @@ public class BluetoothAudioManager {
             return false;
         }
 
+        // If SCO is already active, we're good to go
+        if (isBluetoothScoActive) {
+            Log.i(TAG, "Bluetooth SCO already active, no wait needed");
+            return true;
+        }
+
         switchToBluetooth();
-        long deadline = System.currentTimeMillis() + Math.max(0, timeoutMs);
+        
+        // Increased timeout from 1.2s to 2.5s for slower headsets
+        long actualTimeout = Math.max(2500, timeoutMs);
+        long deadline = System.currentTimeMillis() + actualTimeout;
+        
+        Log.i(TAG, "Waiting for Bluetooth SCO to connect (timeout: " + actualTimeout + "ms)...");
+        
         while (System.currentTimeMillis() < deadline) {
-            if (isBluetoothScoActive) {
-                return true;
+            if (isBluetoothScoActive || audioManager.isBluetoothScoOn()) {
+                // Double check if SCO is actually active
+                if (isBluetoothScoActive) {
+                    Log.i(TAG, "Bluetooth SCO active after " + (actualTimeout - (deadline - System.currentTimeMillis())) + "ms");
+                    return true;
+                }
             }
             try {
-                Thread.sleep(50);
+                Thread.sleep(100);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
         }
 
+        if (isBluetoothScoActive) {
+            return true;
+        }
+
         Log.w(TAG, "Bluetooth SCO not ready before timeout, fallback to phone mic");
-        switchToPhone();
+        // switchToPhone(); // Don't force phone mode yet, the recorder might still try SCO sources
         return false;
     }
 
@@ -185,8 +258,8 @@ public class BluetoothAudioManager {
     }
 
     public void setAudioModeForTTS() {
-        if (isBluetoothHeadsetConnected() && isBluetoothScoActive) {
-            audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+        if (isBluetoothHeadsetConnected()) {
+            switchToBluetooth();
         } else {
             audioManager.setMode(AudioManager.MODE_NORMAL);
         }

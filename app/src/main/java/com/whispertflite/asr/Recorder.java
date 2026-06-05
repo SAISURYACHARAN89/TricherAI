@@ -30,6 +30,8 @@ public class Recorder {
         void onUpdateReceived(String message);
 
         void onDataReceived(float[] samples);
+
+        default void onSpeechDetected() {}
     }
 
     private static final String TAG = "Recorder";
@@ -38,8 +40,8 @@ public class Recorder {
     public static final String MSG_RECORDING = "Recording...";
     public static final String MSG_RECORDING_DONE = "Recording done...!";
     // Silence detection parameters for auto-stop (tuned for 16kHz PCM16 mono).
-    private static final int SILENCE_THRESHOLD = 700; // avg abs amplitude
-    private static final int SILENCE_DURATION_MS = 1200;
+    private static final int SILENCE_THRESHOLD = 1200; // avg abs amplitude - Increased for better sensitivity
+    private static final int SILENCE_DURATION_MS = 2000; // Increased to allow more natural pauses
     private static final int MIN_SPEECH_MS = 300;
 
     private final Context mContext;
@@ -166,9 +168,21 @@ public class Recorder {
         int sampleRateInHz = 16000;
         int channelConfig = AudioFormat.CHANNEL_IN_MONO;
         int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
-        int[] sourceCandidates = preferBluetoothSco
-                ? new int[]{MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC}
-                : new int[]{MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC};
+        
+        int[] sourceCandidates;
+        if (preferBluetoothSco) {
+            // Priority: VOICE_RECOGNITION > VOICE_COMMUNICATION > MIC
+            sourceCandidates = new int[]{
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    MediaRecorder.AudioSource.MIC
+            };
+        } else {
+            sourceCandidates = new int[]{
+                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                    MediaRecorder.AudioSource.MIC
+            };
+        }
 
         int bufferSize = AudioRecord.getMinBufferSize(sampleRateInHz, channelConfig, audioFormat);
         if (bufferSize <= 0) {
@@ -230,6 +244,7 @@ public class Recorder {
         long silentSamples = 0;
         long silenceSamplesThreshold = (long) sampleRateInHz * SILENCE_DURATION_MS / 1000;
         long minSpeechSamples = (long) sampleRateInHz * MIN_SPEECH_MS / 1000;
+        boolean speechStarted = false;
 
         while (mInProgress.get() && totalBytesRead < bytesForThirtySeconds) {
             int bytesRead = audioRecord.read(audioData, 0, bufferSize);
@@ -250,9 +265,13 @@ public class Recorder {
                     silentSamples += sampleCount;
                 } else {
                     silentSamples = 0;
+                    if (!speechStarted && totalSamplesRead >= minSpeechSamples / 2) {
+                        speechStarted = true;
+                        if (mListener != null) mListener.onSpeechDetected();
+                    }
                 }
 
-                if (totalSamplesRead >= minSpeechSamples && silentSamples >= silenceSamplesThreshold) {
+                if (speechStarted && silentSamples >= silenceSamplesThreshold) {
                     mInProgress.set(false); // Auto-stop on sustained silence
                     break;
                 }
