@@ -85,6 +85,18 @@
         private volatile boolean inConversation = false;
         private volatile int studyGapToken = 0;
         private volatile int normalGapToken = 0;
+        // Bumped each time an authoritative listenForCommand starts (segment/note response,
+        // pause handler). Arm listeners snapshot it; if it changed before they reach Whisper
+        // they abort, so they can't overwrite the shared Whisper listener or steal the result.
+        private volatile int listenCommandVersion = 0;
+        // Exclusive-recording guard. There is a single shared `recorder`; many async threads
+        // (arm listeners, segment/note response listeners, pause listener, wake question) try
+        // to use it. Each session claims it via claimRecorder() which cancels any older session
+        // and returns a generation id. A session may ONLY call recorder.stop() while it is still
+        // the current owner — otherwise a stale thread would kill the newer recording (the cause
+        // of the post-"new"/hello freeze where the question never records).
+        private volatile int sttGeneration = 0;
+        private final Object recorderLock = new Object();
 
         private volatile boolean ttsReady = false;
         private boolean ttsInitializing = false;
@@ -324,15 +336,22 @@
 
                 // Add beep after question is asked
                 ui.postDelayed(() -> {
-                    if (!studyModeActive) return;
+                    if (studyModeSession == null) return;
+                    // Invalidate any pending/running arm listener so it can't steal this "yes".
+                    studyGapToken++;
+                    sttActive = false;
+                    if (recorder != null && recorder.isInProgress()) recorder.stop();
                     beepSingle(); // 🎯 ADD THIS BEEP
 
                     ui.postDelayed(() -> {
-                        if (!studyModeActive) return;
+                        if (studyModeSession == null) return;
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
-                                if (!studyModeActive) return;
+                                // studyModeSession == null is the definitive "ended" check;
+                                // studyModeActive can be transiently false due to races.
+                                if (studyModeSession == null) return;
+                                if (!studyModeActive) studyModeActive = true;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Segment response received: " + response);
 
@@ -340,7 +359,7 @@
                                 MainActivity.this.beepDouble();
 
                                 ui.post(() -> {
-                                    if (!studyModeActive) return;
+                                    if (studyModeSession == null) return;
                                     boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
                                             response.contains("sure") || response.contains("okay");
 
@@ -375,22 +394,28 @@
 
                 // Add beep after question is asked
                 ui.postDelayed(() -> {
-                    if (!studyModeActive) return;
+                    if (studyModeSession == null) return;
+                    // Invalidate any pending/running arm listener so it can't steal this "yes".
+                    studyGapToken++;
+                    sttActive = false;
+                    if (recorder != null && recorder.isInProgress()) recorder.stop();
                     beepSingle(); // 🎯 ADD THIS BEEP
 
                     ui.postDelayed(() -> {
-                        if (!studyModeActive) return;
+                        if (studyModeSession == null) return;
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
-                                if (!studyModeActive) return;
+                                if (studyModeSession == null) return;
+                                if (!studyModeActive) studyModeActive = true;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Note response received: " + response);
 
                                 // 🔥 FIX: Add double beep to acknowledge user response (matches AI mode)
                                 MainActivity.this.beepDouble();
 
-                                boolean wantsToStudy = response.contains("yes");
+                                boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
+                                        response.contains("sure") || response.contains("okay");
 
                                 if (wantsToStudy && !note.content.isEmpty()) {
                                     Log.i(TAG, "User wants to study note: " + note.name);
@@ -431,6 +456,14 @@
         public void endStudyMode() {
             ui.post(() -> {
                 Log.i(TAG, "Ending study mode");
+                // Invalidate all pending arm/listen sessions and stop any in-flight
+                // recording so a leftover study recording can't collide with the next
+                // wake-word question recording (they share the same recorder/whisper).
+                studyGapToken++;
+                listenCommandVersion++;
+                if (recorder != null && recorder.isInProgress()) {
+                    try { recorder.stop(); } catch (Exception ignored) {}
+                }
                 // Hard reset all study-mode related flags so that
                 // subsequent wake word + commands work reliably
                 studyModeActive = false;
@@ -445,14 +478,6 @@
                 ttsSpeaking = false;
                 sttActive = false;
                 responsePaused = false;
-
-                // speak("Study mode completed. Returning to normal mode.");
-                
-                // Use safeSpeak or direct tts.speak to avoid "utt" ID that triggers STT
-                if (tts != null && ttsReady) {
-                    requestTtsAudioFocus();
-                    tts.speak("Study mode completed. Returning to normal mode.", TextToSpeech.QUEUE_FLUSH, null, "study_exit_msg");
-                }
 
                 // Clear any pending study-mode timeouts
                 studyModeTimeoutHandler.removeCallbacksAndMessages(null);
@@ -669,10 +694,18 @@
                         safeStopTTS();
                         currentChunkIndex = 0;
                         responseChunks.clear();
-                        // 🔥 FIX: Don't speak - just start STT silently
+                        inConversation = false;
                         Log.i(TAG, "✅ New question mode");
-                        beepSingle();
-                        startSTTFromWake();
+                        // Pause Vosk BEFORE speaking so "hello" in the phrase doesn't
+                        // self-trigger the wake receiver. onDone("wake_prompt") resumes.
+                        WakeWordService.pauseListening(MainActivity.this);
+                        ui.postDelayed(() -> {
+                            if (tts != null && ttsReady) {
+                                requestTtsAudioFocus();
+                                tts.speak("Say hello to ask your new question.",
+                                        TextToSpeech.QUEUE_FLUSH, null, "wake_prompt");
+                            }
+                        }, 200);
                         return;
                     } else if (lowerCmd.contains("stop") || lowerCmd.contains("exit") || lowerCmd.contains("end")) {
                         // Handle stop/exit command
@@ -912,14 +945,18 @@
                 currentChunkIndex = 0;
                 responseChunks.clear();
 
-                // 🔥 FIX: Exit study mode and ask new question
                 Log.i(TAG, "✅ Study mode NEW QUESTION - exiting study mode");
-                endStudyMode();
+                endStudyMode(); // sets studyModeActive=false, switches Vosk to WAKE mode
 
-                // After exiting study mode, start listening for new question
+                // Pause Vosk BEFORE speaking so the word "hello" in the phrase doesn't
+                // self-trigger the wake receiver. onDone("wake_prompt") resumes wake mode.
                 ui.postDelayed(() -> {
-                    beepSingle();
-                    startSTTFromWake();
+                    WakeWordService.pauseListening(MainActivity.this);
+                    if (tts != null && ttsReady) {
+                        requestTtsAudioFocus();
+                        tts.speak("Study mode ended. Say hello to ask your new question.",
+                                TextToSpeech.QUEUE_FLUSH, null, "wake_prompt");
+                    }
                 }, 300);
                 return;
             }
@@ -1292,9 +1329,16 @@
         }
         private void armStudyModeCommandListening(int token) {
             if (!studyModeActive) return;
+            // If a segment/note response listener has already bumped the token, don't
+            // record — otherwise claiming the recorder would cancel that listener.
+            if (studyGapToken != token) {
+                Log.i(TAG, "🎧 Arm skipped — token superseded (" + token + " vs " + studyGapToken + ")");
+                return;
+            }
 
             Log.i(TAG, "🎧 Arming STT for study mode commands (token=" + token + ")");
 
+            // NOT authoritative — must never pre-empt a segment/note response listener.
             listenForCommand(pauseGap * 1000, result -> {
                 if (result == null || result.trim().isEmpty()) return;
                 if (studyGapToken != token) return; // ❗ stale STT result
@@ -1306,7 +1350,7 @@
                 studyGapToken++;
 
 
-            });
+            }, false);
         }
 
 
@@ -1842,6 +1886,12 @@
                 final String[] resultArr = new String[1];
 
                 new Thread(() -> {
+                    // Claim the recorder exclusively. This cancels any leftover study/arm
+                    // recording; stale threads detect the generation change and bail without
+                    // stopping our recording. Also bump the command version so command
+                    // listeners abort before touching Whisper.
+                    listenCommandVersion++;
+                    final int myGen = claimRecorder();
                     try {
                         inConversation = true;
                         WakeWordService.pauseListening(MainActivity.this);
@@ -1849,7 +1899,7 @@
                         configureRecorderInputRouting();
                         recorder.setFilePath(new File(dataDir, WaveUtil.RECORDING_FILE).getAbsolutePath());
                         sttActive = true;
-                        
+
                         // NEW: Interruption support
                         recorder.setListener(new Recorder.RecorderListener() {
                             @Override public void onUpdateReceived(String m) {}
@@ -1860,7 +1910,7 @@
                                 if (ttsSpeaking) {
                                     Log.i(TAG, "Speech detected while AI speaking! Interrupting...");
                                     safeStopTTS();
-                                    
+
                                     // Give a small beep to acknowledge interruption
                                     beepSingle();
                                 }
@@ -1872,9 +1922,17 @@
                         long startMs = System.currentTimeMillis();
                         // Increased from 5s to 30s to allow long questions
                         while (recorder.isInProgress() && System.currentTimeMillis() - startMs < 30000) {
+                            // Superseded by a newer session — bail without stopping it.
+                            if (sttGeneration != myGen) {
+                                Log.i(TAG, "askWithSpeech: superseded by newer session, bailing");
+                                resultArr[0] = "";
+                                return;
+                            }
                             Thread.sleep(50);
                         }
-                        recorder.stop();
+                        if (sttGeneration == myGen && recorder.isInProgress()) {
+                            recorder.stop();
+                        }
                         beepDouble();
 
                         final CountDownLatch whisperLatch = new CountDownLatch(1);
@@ -1960,7 +2018,11 @@
                             speak(resultArr[0]);
                         }
                     } catch (Exception e) { resultArr[0] = "Speech error"; }
-                    finally { sttActive = false; latch.countDown(); }
+                    finally {
+                        // Only release the STT lock if we're still the owner.
+                        if (sttGeneration == myGen) sttActive = false;
+                        latch.countDown();
+                    }
                 }).start();
 
                 try { latch.await(40, TimeUnit.SECONDS); } catch (Exception ignored) {}
@@ -2746,20 +2808,39 @@
         }
         private final AtomicBoolean sttLock = new AtomicBoolean(false);
 
-        private void listenForCommand(int durationMs, CommandCallback callback) {
-            new Thread(() -> {
-
-                // Prevent overlapping STT sessions
-                if (sttActive) {
-                    return;
+        // Cancels any in-progress recording and claims the shared recorder exclusively.
+        // Returns a generation id; the caller may only call recorder.stop() while
+        // sttGeneration still equals this id (otherwise a newer session owns the recorder).
+        private int claimRecorder() {
+            synchronized (recorderLock) {
+                int gen = ++sttGeneration;
+                if (recorder != null && recorder.isInProgress()) {
+                    try { recorder.stop(); } catch (Exception ignored) {}
                 }
+                return gen;
+            }
+        }
+
+        // Segment/note response listeners and pause handlers are authoritative (default true).
+        // Arm listeners MUST pass false so they never pre-empt a newer authoritative session.
+        private void listenForCommand(int durationMs, CommandCallback callback) {
+            listenForCommand(durationMs, callback, true);
+        }
+
+        private void listenForCommand(int durationMs, CommandCallback callback, boolean authoritative) {
+            new Thread(() -> {
 
     // ⛔ block TTS overlap ONLY outside study mode
                 if (ttsSpeaking && !studyModeActive) {
+                    callback.onResult("");
                     return;
                 }
 
-
+                // Authoritative callers bump the version so any arm listener still waiting
+                // will detect the change below and abort before touching Whisper.
+                final int myVersion = authoritative ? ++listenCommandVersion : listenCommandVersion;
+                // Claim the recorder exclusively — this cancels any older recording session.
+                final int myGen = claimRecorder();
 
                 sttActive = true;
 
@@ -2782,11 +2863,29 @@
 
                     long startMs = System.currentTimeMillis();
                     while (recorder.isInProgress() && System.currentTimeMillis() - startMs < durationMs) {
+                        // A newer session claimed the recorder — bail WITHOUT stopping it
+                        // (stopping would kill the newer recording).
+                        if (sttGeneration != myGen) {
+                            Log.i(TAG, "listenForCommand: superseded by newer session, bailing");
+                            callback.onResult("");
+                            return;
+                        }
                         Thread.sleep(50);
                     }
 
-                    recorder.stop();
+                    // Only the current owner may stop the recorder.
+                    if (sttGeneration == myGen && recorder.isInProgress()) {
+                        recorder.stop();
+                    }
                     Log.i(TAG, "STT command recording stopped");
+
+                    // If a newer session/listener started while we recorded, abort — otherwise
+                    // we'd overwrite its Whisper setup and steal its result.
+                    if (sttGeneration != myGen || listenCommandVersion != myVersion) {
+                        Log.i(TAG, "listenForCommand: stale before whisper (gen " + myGen + "/" + sttGeneration + ", ver " + myVersion + "/" + listenCommandVersion + "), aborting");
+                        callback.onResult("");
+                        return;
+                    }
 
                     if (whisper == null) {
                         Log.e(TAG, "Whisper not initialized");
@@ -2815,8 +2914,8 @@
                     Log.e(TAG, "Cmd listen fail", e);
                     callback.onResult("");
                 } finally {
-                    // 🔒 ALWAYS release STT lock
-                    sttActive = false;
+                    // 🔒 Release STT lock only if we're still the owner
+                    if (sttGeneration == myGen) sttActive = false;
                 }
 
             }).start();
@@ -3547,11 +3646,15 @@
         private void startSTTFromWake() {
             inConversation = true; // Mark as in conversation for continuous flow
             sttActive = true; // Ensure STT is marked active so interruptions work
-            
+
             // Stop any background wake word listening during active STT
             WakeWordService.pauseListening(MainActivity.this);
 
-            ui.post(() -> web.evaluateJavascript("if(window.startVoiceFromWake) window.startVoiceFromWake()", null));
+            // Force JS callActive = true so startVoiceFromWake isn't gated out.
+            // JS callActive may be false when the user was in study mode (no UI call button press).
+            ui.post(() -> web.evaluateJavascript(
+                    "callActive = true; if(window.startVoiceFromWake) window.startVoiceFromWake()",
+                    null));
         }
 
         private void requestMicPermission() {
