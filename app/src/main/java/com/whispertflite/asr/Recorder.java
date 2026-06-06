@@ -272,7 +272,11 @@ public class Recorder {
                 }
 
                 if (speechStarted && silentSamples >= silenceSamplesThreshold) {
-                    mInProgress.set(false); // Auto-stop on sustained silence
+                    // Auto-stop on sustained silence. Do NOT clear mInProgress here —
+                    // the WAV file hasn't been written yet. If isInProgress() flipped to
+                    // false now, callers would skip the stop()/save wait and transcribe the
+                    // PREVIOUS recording (the "last question / last input" bug). mInProgress
+                    // is cleared below, only once the file is actually saved.
                     break;
                 }
 
@@ -297,8 +301,11 @@ public class Recorder {
         WaveUtil.createWaveFile(mWavFilePath, outputBuffer.toByteArray(), sampleRateInHz, channels, bytesPerSample);
         sendUpdate(MSG_RECORDING_DONE);
 
-        // Notify the waiting thread that recording is complete
+        // Notify the waiting thread that recording is complete. Clear mInProgress here
+        // (under the same lock) so isInProgress() only reports false once the WAV is on
+        // disk — guaranteeing any reader transcribes THIS recording, not the previous one.
         synchronized (fileSavedLock) {
+            mInProgress.set(false);
             fileSaved = true;
             fileSavedLock.notify(); // Notify that recording is finished
         }

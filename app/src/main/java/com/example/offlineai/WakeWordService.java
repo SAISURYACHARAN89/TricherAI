@@ -93,9 +93,11 @@ public class WakeWordService extends Service {
             commandWords.add("resume");
             commandWords.add("repeat");
             commandWords.add("stop");
-            commandWords.add("restart");     // ✅ ADD
-            commandWords.add("new");         // ✅ ADD
-            commandWords.add("question");    // ✅ ADD
+            commandWords.add("restart");
+            commandWords.add("new");
+            commandWords.add("question");
+            commandWords.add("no");
+            commandWords.add("yes");
         }
     }
 

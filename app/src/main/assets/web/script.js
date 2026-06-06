@@ -257,9 +257,12 @@ const magicWords = [
 let appSettings = {
   allowQuestionRepeat: false,
   autoPause: false,
+  autoPauseStudy: false,
   contextMode: false,
   pauseGap: 5,
   wordsGap: 6,
+  studyPauseGap: 5,
+  studyWordsGap: 6,
   talkingSpeed: 1.0
 };
 
@@ -271,31 +274,43 @@ function loadSettings() {
 
   document.getElementById("allowQuestionRepeat").checked = appSettings.allowQuestionRepeat;
   document.getElementById("autoPause").checked = appSettings.autoPause;
+  document.getElementById("autoPauseStudy").checked = appSettings.autoPauseStudy ?? false;
   document.getElementById("contextMode").checked = appSettings.contextMode ?? false;
   document.getElementById("pauseGap").value = appSettings.pauseGap;
   document.getElementById("wordsGap").value = appSettings.wordsGap;
+  document.getElementById("studyPauseGap").value = appSettings.studyPauseGap ?? 5;
+  document.getElementById("studyWordsGap").value = appSettings.studyWordsGap ?? 6;
   document.getElementById("speedRange").value = appSettings.talkingSpeed;
   document.getElementById("speedVal").innerText = appSettings.talkingSpeed + "x";
 
   toggleAutoPauseSubSettings(appSettings.autoPause);
+  toggleStudyAutoPauseSubSettings(appSettings.autoPauseStudy ?? false);
   window.AndroidBridge?.updateSettings?.(JSON.stringify(appSettings));
 }
 
 function updateSettings() {
   appSettings.allowQuestionRepeat = document.getElementById("allowQuestionRepeat").checked;
   appSettings.autoPause = document.getElementById("autoPause").checked;
+  appSettings.autoPauseStudy = document.getElementById("autoPauseStudy").checked;
   appSettings.contextMode = document.getElementById("contextMode").checked;
   appSettings.pauseGap = +document.getElementById("pauseGap").value;
   appSettings.wordsGap = +document.getElementById("wordsGap").value;
+  appSettings.studyPauseGap = +document.getElementById("studyPauseGap").value;
+  appSettings.studyWordsGap = +document.getElementById("studyWordsGap").value;
   appSettings.talkingSpeed = +document.getElementById("speedRange").value;
 
   toggleAutoPauseSubSettings(appSettings.autoPause);
+  toggleStudyAutoPauseSubSettings(appSettings.autoPauseStudy);
   localStorage.setItem("appSettings", JSON.stringify(appSettings));
   window.AndroidBridge?.updateSettings?.(JSON.stringify(appSettings));
 }
 
 function toggleAutoPauseSubSettings(show) {
   document.getElementById("autoPauseSubSettings").style.display = show ? "block" : "none";
+}
+
+function toggleStudyAutoPauseSubSettings(show) {
+  document.getElementById("autoPauseStudySubSettings").style.display = show ? "block" : "none";
 }
 
 /* ================= AUTH ================= */

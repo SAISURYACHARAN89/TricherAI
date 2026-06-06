@@ -41,6 +41,15 @@ public class Whisper {
     private String mWavFilePath;
     private WhisperListener mUpdateListener;
 
+    // Snapshot of the request captured at start() time. The worker delivers results
+    // to THESE — so a transcription always reports back to the listener that asked
+    // for it, even if setListener()/setFilePath() are changed mid-flight by a newer
+    // session. Without this, a still-running transcription's result leaks to the
+    // next listener (the "last question" off-by-one bug).
+    private WhisperListener mActiveListener;
+    private String mActiveWavFilePath;
+    private Action mActiveAction;
+
     private final Lock taskLock = new ReentrantLock();
     private final Condition hasTask = taskLock.newCondition();
     private volatile boolean taskAvailable = false;
@@ -88,6 +97,11 @@ public class Whisper {
         mInProgress.set(true);
         taskLock.lock();
         try {
+            // Capture the request now so the result is delivered to the listener that
+            // requested THIS transcription, not whatever listener is set when it finishes.
+            mActiveListener = mUpdateListener;
+            mActiveWavFilePath = mWavFilePath;
+            mActiveAction = mAction;
             taskAvailable = true;
             hasTask.signal();
         } finally {
@@ -121,50 +135,59 @@ public class Whisper {
     }
 
     private void transcribeFile() {
+        // Use the snapshot captured at start() — never the live mUpdateListener/mWavFilePath,
+        // which a newer session may already have overwritten.
+        final WhisperListener listener = mActiveListener;
+        final String wavFilePath = mActiveWavFilePath;
+        final Action action = mActiveAction;
         try {
-            if (mWhisperEngine.isInitialized() && mWavFilePath != null) {
-                File waveFile = new File(mWavFilePath);
+            if (mWhisperEngine.isInitialized() && wavFilePath != null) {
+                File waveFile = new File(wavFilePath);
                 if (waveFile.exists()) {
                     long startTime = System.currentTimeMillis();
-                    sendUpdate(MSG_PROCESSING);
+                    sendUpdate(listener, MSG_PROCESSING);
 
                     String result = null;
                     synchronized (mWhisperEngine) {
-                        if (mAction == Action.TRANSCRIBE) {
-                            result = mWhisperEngine.transcribeFile(mWavFilePath);
+                        if (action == Action.TRANSCRIBE) {
+                            result = mWhisperEngine.transcribeFile(wavFilePath);
                         } else {
-//                            result = mWhisperEngine.getTranslation(mWavFilePath);
+//                            result = mWhisperEngine.getTranslation(wavFilePath);
                             Log.d(TAG, "TRANSLATE feature is not implemented");
                         }
                     }
-                    sendResult(result);
+                    sendResult(listener, result);
 
                     long timeTaken = System.currentTimeMillis() - startTime;
                     Log.d(TAG, "Time Taken for transcription: " + timeTaken + "ms");
-                    sendUpdate(MSG_PROCESSING_DONE);
+                    sendUpdate(listener, MSG_PROCESSING_DONE);
                 } else {
-                    sendUpdate(MSG_FILE_NOT_FOUND);
+                    sendUpdate(listener, MSG_FILE_NOT_FOUND);
                 }
             } else {
-                sendUpdate("Engine not initialized or file path not set");
+                sendUpdate(listener, "Engine not initialized or file path not set");
             }
         } catch (Exception e) {
             Log.e(TAG, "Error during transcription", e);
-            sendUpdate("Transcription failed: " + e.getMessage());
+            sendUpdate(listener, "Transcription failed: " + e.getMessage());
         } finally {
             mInProgress.set(false);
         }
     }
 
     private void sendUpdate(String message) {
-        if (mUpdateListener != null) {
-            mUpdateListener.onUpdateReceived(message);
+        sendUpdate(mUpdateListener, message);
+    }
+
+    private void sendUpdate(WhisperListener listener, String message) {
+        if (listener != null) {
+            listener.onUpdateReceived(message);
         }
     }
 
-    private void sendResult(String message) {
-        if (mUpdateListener != null) {
-            mUpdateListener.onResultReceived(message);
+    private void sendResult(WhisperListener listener, String message) {
+        if (listener != null) {
+            listener.onResultReceived(message);
         }
     }
 

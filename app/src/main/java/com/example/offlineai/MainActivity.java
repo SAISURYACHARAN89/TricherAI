@@ -118,9 +118,12 @@
         // App Settings
         private boolean allowQuestionRepeat = false;
         private boolean autoPause = false;
+        private boolean autoPauseStudy = false;
         private boolean contextModeEnabled = false;
         private int pauseGap = 5;
         private int wordsGap = 6;
+        private int studyPauseGap = 5;
+        private int studyWordsGap = 6;
         private String pendingUtteranceId = null;
         private Bundle pendingUtteranceParams = null;
 
@@ -334,48 +337,48 @@
             private void listenForSegmentResponse(StudySegment segment) {
                 Log.i(TAG, "Listening for response on segment: " + segment.name);
 
-                // Add beep after question is asked
                 ui.postDelayed(() -> {
                     if (studyModeSession == null) return;
                     // Invalidate any pending/running arm listener so it can't steal this "yes".
                     studyGapToken++;
                     sttActive = false;
                     if (recorder != null && recorder.isInProgress()) recorder.stop();
-                    beepSingle(); // 🎯 ADD THIS BEEP
+                    // Pause Vosk while Whisper listens for yes/no — prevents pause/repeat/new
+                    // from misfiring during the answer window.
+                    WakeWordService.pauseListening(MainActivity.this);
+                    beepSingle();
 
                     ui.postDelayed(() -> {
-                        if (studyModeSession == null) return;
+                        if (studyModeSession == null) {
+                            WakeWordService.resumeCommandMode(MainActivity.this);
+                            return;
+                        }
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
-                                // studyModeSession == null is the definitive "ended" check;
-                                // studyModeActive can be transiently false due to races.
                                 if (studyModeSession == null) return;
                                 if (!studyModeActive) studyModeActive = true;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Segment response received: " + response);
-
-                                // 🔥 FIX: Add double beep to acknowledge user response (matches AI mode)
                                 MainActivity.this.beepDouble();
+                                // Vosk back on — Whisper is done
+                                if (studyModeSession != null) WakeWordService.resumeCommandMode(MainActivity.this);
 
                                 ui.post(() -> {
                                     if (studyModeSession == null) return;
-                                    boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
-                                            response.contains("sure") || response.contains("okay");
+                                    int yn = MainActivity.this.classifyYesNo(response);
 
-                                    if (wantsToStudy && !segment.notes.isEmpty()) {
+                                    if (yn == 1 && !segment.notes.isEmpty()) {
                                         Log.i(TAG, "User wants to study segment: " + segment.name);
                                         currentNoteIndex = 0;
                                         inSegmentSelection = false;
                                         inNoteSelection = true;
                                         startNoteSelection(segment);
-                                    } else if (response.contains("no") || response.contains("skip") || response.trim().isEmpty()) {
+                                    } else if (yn == -1 || response.trim().isEmpty()) {
                                         Log.i(TAG, "User skipping segment: " + segment.name);
-                                        // Move to next segment
                                         currentSegmentIndex++;
                                         nextSegment();
                                     } else {
-                                        // Didn't understand, repeat the question
                                         MainActivity.this.speakForStudyMode(
                                                 "I didn't understand. Do you want to study this segment? Say yes or no.",
                                                 CALLBACK_SEGMENT,
@@ -386,23 +389,27 @@
                             }
                         });
                     }, 100);
-                }, 100); // Wait after the question
+                }, 100);
             }
 
             private void listenForNoteResponse(StudySegment segment, StudyNote note) {
                 Log.i(TAG, "Listening for response on note: " + note.name);
 
-                // Add beep after question is asked
                 ui.postDelayed(() -> {
                     if (studyModeSession == null) return;
                     // Invalidate any pending/running arm listener so it can't steal this "yes".
                     studyGapToken++;
                     sttActive = false;
                     if (recorder != null && recorder.isInProgress()) recorder.stop();
-                    beepSingle(); // 🎯 ADD THIS BEEP
+                    // Pause Vosk while Whisper listens for yes/no
+                    WakeWordService.pauseListening(MainActivity.this);
+                    beepSingle();
 
                     ui.postDelayed(() -> {
-                        if (studyModeSession == null) return;
+                        if (studyModeSession == null) {
+                            WakeWordService.resumeCommandMode(MainActivity.this);
+                            return;
+                        }
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
@@ -410,22 +417,27 @@
                                 if (!studyModeActive) studyModeActive = true;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Note response received: " + response);
-
-                                // 🔥 FIX: Add double beep to acknowledge user response (matches AI mode)
                                 MainActivity.this.beepDouble();
+                                // Vosk back on — Whisper is done
+                                if (studyModeSession != null) WakeWordService.resumeCommandMode(MainActivity.this);
 
-                                boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
-                                        response.contains("sure") || response.contains("okay");
+                                int yn = MainActivity.this.classifyYesNo(response);
 
-                                if (wantsToStudy && !note.content.isEmpty()) {
+                                if (yn == 1 && !note.content.isEmpty()) {
                                     Log.i(TAG, "User wants to study note: " + note.name);
                                     readingNoteContent = true;
                                     readNoteContent(note);
-                                } else {
+                                } else if (yn == -1 || response.trim().isEmpty()) {
                                     Log.i(TAG, "User skipping note: " + note.name);
-                                    // Move to next note
                                     currentNoteIndex++;
                                     startNoteSelection(segment);
+                                } else {
+                                    // Unrecognized — re-ask instead of silently skipping (mirrors segments).
+                                    MainActivity.this.speakForStudyMode(
+                                            "I didn't understand. Do you want to study this note? Say yes or no.",
+                                            CALLBACK_NOTE,
+                                            note.id
+                                    );
                                 }
                             }
                         });
@@ -755,8 +767,14 @@
                 return;
             }
 
-            // 🔥 FIX: Don't call handleMagicWordCommand for study mode!
-            // Study mode has its own command handlers below
+            // "yes"/"no" are now in the Vosk grammar to prevent "no" → "new" misfire.
+            // But yes/no responses to segment/note questions are handled by the Whisper
+            // listener — Vosk should never act on them here.
+            if (lowerCmd.equals("yes") || lowerCmd.equals("no")) {
+                Log.i(TAG, "Ignoring Vosk yes/no — handled by Whisper segment listener");
+                return;
+            }
+
             /* ===================== PAUSE ===================== */
             if (lowerCmd.contains("pause")) {
                 Log.i(TAG, "🎯 PAUSE COMMAND in study mode - TTS Speaking: " + ttsSpeaking +
@@ -1344,11 +1362,23 @@
                 if (studyGapToken != token) return; // ❗ stale STT result
 
                 String cmd = result.toLowerCase().trim();
+
+                // Only cancel the scheduled next chunk for real recognized commands.
+                // Whisper often returns noise/garbage — ignore anything that isn't a
+                // known study command word, so background noise doesn't silently kill playback.
+                boolean isKnownCommand = cmd.contains("pause") || cmd.contains("resume") ||
+                        cmd.contains("repeat") || cmd.contains("new") || cmd.contains("stop") ||
+                        cmd.contains("restart") || cmd.contains("question") ||
+                        cmd.equals("no") || cmd.equals("yes");
+                if (!isKnownCommand) {
+                    Log.i(TAG, "🎙 Arm ignored unrecognized noise: " + cmd);
+                    return;
+                }
+
                 Log.i(TAG, "🎙 Study command detected during gap: " + cmd);
 
-                // 🔥 CANCEL scheduled next chunk
+                // CANCEL scheduled next chunk — Vosk will handle the command properly
                 studyGapToken++;
-
 
             }, false);
         }
@@ -1539,11 +1569,11 @@
             @JavascriptInterface
             public void testStudyModeAutoPause() {
                 ui.post(() -> {
-                    Log.i(TAG, "Testing study mode autoPause - Current setting: " + autoPause);
+                    Log.i(TAG, "Testing study mode autoPause - Current setting: " + autoPauseStudy);
                     Toast.makeText(MainActivity.this,
-                            "Study Mode AutoPause: " + (autoPause ? "ON" : "OFF") +
-                                    "\nWords per chunk: " + wordsGap +
-                                    "\nPause gap: " + pauseGap + "s",
+                            "Study Mode AutoPause: " + (autoPauseStudy ? "ON" : "OFF") +
+                                    "\nWords per chunk: " + studyWordsGap +
+                                    "\nPause gap: " + studyPauseGap + "s",
                             Toast.LENGTH_LONG).show();
                 });
             }
@@ -1604,12 +1634,15 @@
                     JSONObject obj = new JSONObject(json);
                     allowQuestionRepeat = obj.optBoolean("allowQuestionRepeat", false);
                     autoPause = obj.optBoolean("autoPause", false);
+                    autoPauseStudy = obj.optBoolean("autoPauseStudy", false);
                     contextModeEnabled = obj.optBoolean("contextMode", false);
                     pauseGap = obj.optInt("pauseGap", 5);
                     wordsGap = obj.optInt("wordsGap", 6);
+                    studyPauseGap = obj.optInt("studyPauseGap", 5);
+                    studyWordsGap = obj.optInt("studyWordsGap", 6);
                     speechRate = (float) obj.optDouble("talkingSpeed", 1.0);
                     ui.post(() -> { if (tts != null) tts.setSpeechRate(speechRate); });
-                    Log.i(TAG, "Settings updated: AutoPause=" + autoPause + ", ContextMode=" + contextModeEnabled);
+                    Log.i(TAG, "Settings updated: AutoPause=" + autoPause + ", AutoPauseStudy=" + autoPauseStudy + ", ContextMode=" + contextModeEnabled);
                 } catch (Exception e) { Log.e(TAG, "Settings update fail", e); }
             }
 
@@ -2061,6 +2094,35 @@
             ));
         }
 
+        /* ===================== YES / NO CLASSIFICATION ===================== */
+        // Whisper-base.en is unreliable on single words, so match whole tokens (not
+        // substrings — "another"/"now" must not read as "no") and treat a response that
+        // contains BOTH yes and no tokens (e.g. an echo of the "say yes or no" prompt) as
+        // unrecognized rather than silently picking one.
+        private static final java.util.Set<String> YES_WORDS = new java.util.HashSet<>(java.util.Arrays.asList(
+                "yes", "yeah", "yep", "yup", "ya", "yah", "yes.", "sure", "ok", "okay", "okey",
+                "correct", "right", "continue", "proceed", "definitely", "absolutely", "study", "affirmative"));
+        private static final java.util.Set<String> NO_WORDS = new java.util.HashSet<>(java.util.Arrays.asList(
+                "no", "nope", "nah", "naw", "noo", "skip", "next", "dont", "never",
+                "negative", "pass", "cancel", "know"));
+
+        /** @return 1 = affirmative, -1 = negative, 0 = unrecognized/ambiguous. */
+        private int classifyYesNo(String raw) {
+            if (raw == null) return 0;
+            String s = raw.toLowerCase().replaceAll("[^a-z' ]", " ");
+            boolean hasYes = false, hasNo = false;
+            for (String tok : s.split("\\s+")) {
+                String t = tok.replace("'", "");
+                if (t.isEmpty()) continue;
+                if (YES_WORDS.contains(t)) hasYes = true;
+                if (NO_WORDS.contains(t)) hasNo = true;
+            }
+            if (hasYes && hasNo) return 0; // ambiguous / echoed prompt
+            if (hasYes) return 1;
+            if (hasNo) return -1;
+            return 0;
+        }
+
         /* ===================== AI FLOW LOGIC ===================== */
         private void speakConfirmation(String msg, String originalQuestion) {
             Log.i(TAG, "speakConfirmation called: " + msg);
@@ -2098,9 +2160,7 @@
                                         beepDouble();
 
                                         ui.postDelayed(() -> {
-                                            if (cmd.contains("yes") || cmd.contains("yeah") ||
-                                                    cmd.contains("continue") || cmd.contains("go ahead") ||
-                                                    cmd.contains("yes.") || cmd.contains("yes?")) {
+                                            if (classifyYesNo(cmd) == 1) {
 
                                                 Log.i(TAG, "✅ User confirmed YES, handling question");
                                                 // Reset TTS listener back to main one
@@ -2199,7 +2259,7 @@
                     }
 
                     // Handle study mode chunks with autoPause
-                    if (id.startsWith("study_content_") && id.contains("_chunk_") && autoPause && !responsePaused) {
+                    if (id.startsWith("study_content_") && id.contains("_chunk_") && autoPauseStudy && !responsePaused) {
                         Log.i(TAG, "Study mode chunk completed: " + id);
 
                         String[] parts = id.split("_");
@@ -2242,7 +2302,7 @@
                             if (studyGapToken != myToken) return;
 
                             playStudyNextChunk(noteId);
-                        }, pauseGap * 1000);
+                        }, studyPauseGap * 1000);
 
                         return;
                     }
@@ -2374,14 +2434,14 @@
         private void speakStudyContentWithAutoPause(String text, String noteId) {
             Log.i(TAG, "speakStudyContentWithAutoPause for note: " + noteId);
 
-            // Process text into chunks based on wordsGap setting
+            // Process text into chunks based on studyWordsGap setting
             String[] words = text.split("\\s+");
             List<String> studyChunks = new ArrayList<>();
             StringBuilder currentChunk = new StringBuilder();
 
             for (int i = 0; i < words.length; i++) {
                 currentChunk.append(words[i]).append(" ");
-                if ((i + 1) % wordsGap == 0 || i == words.length - 1) {
+                if ((i + 1) % studyWordsGap == 0 || i == words.length - 1) {
                     studyChunks.add(currentChunk.toString().trim());
                     currentChunk = new StringBuilder();
                 }
@@ -2457,10 +2517,10 @@
             Log.i(TAG, "speakForStudyMode: " + callbackType + " - " +
                     (text.length() > 50 ? text.substring(0, 50) + "..." : text));
 
-            // 🔥 NEW: Handle autoPause for note content specifically
-            if (CALLBACK_CONTENT.equals(callbackType) && autoPause && callActive) {
+            // Handle autoPause for note content specifically (study mode uses its own setting)
+            if (CALLBACK_CONTENT.equals(callbackType) && autoPauseStudy && callActive) {
                 Log.i(TAG, "AutoPause enabled for study mode content, chunking text");
-                Log.i(TAG, "Words per chunk: " + wordsGap + ", Pause gap: " + pauseGap + "s");
+                Log.i(TAG, "Words per chunk: " + studyWordsGap + ", Pause gap: " + studyPauseGap + "s");
                 speakStudyContentWithAutoPause(text, extraData);
                 return;
             }

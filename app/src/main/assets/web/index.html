@@ -451,11 +451,8 @@
         <div class="setting-item row">
             <div style="display: inline-block; text-align: center;">
                 <span style="display: block; font-size: 16px;">Auto Pause</span>
-                <div style="margin-top: 2px;">
-<!--                    <span style="color: orange; font-size: 12px; font-weight: bold;">beta</span>-->
-                </div>
                 <div style="margin-top: 1px;">
-                    <span style="color: orange; font-size: 10px; opacity: 0.9;">under beta testing</span>
+                    <span style="color: #4fc3f7; font-size: 10px; opacity: 0.9;">normal mode</span>
                 </div>
             </div>
             <label class="switch">
@@ -476,6 +473,38 @@
             <div class="setting-item row small">
                 <span>Gap after words</span>
                 <select id="wordsGap" onchange="updateSettings()">
+                    <option value="3">3</option>
+                    <option value="6" selected>6</option>
+                    <option value="10">10</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="setting-item row">
+            <div style="display: inline-block; text-align: center;">
+                <span style="display: block; font-size: 16px;">Auto Pause</span>
+                <div style="margin-top: 1px;">
+                    <span style="color: #81c784; font-size: 10px; opacity: 0.9;">study mode</span>
+                </div>
+            </div>
+            <label class="switch">
+                <input type="checkbox" id="autoPauseStudy" onchange="updateSettings()">
+                <span class="slider round"></span>
+            </label>
+        </div>
+
+        <div id="autoPauseStudySubSettings" style="display: none; width: 100%; padding-left: 10px;">
+            <div class="setting-item row small">
+                <span>Pause Gap (sec)</span>
+                <select id="studyPauseGap" onchange="updateSettings()">
+                    <option value="2">2</option>
+                    <option value="5" selected>5</option>
+                    <option value="7">7</option>
+                </select>
+            </div>
+            <div class="setting-item row small">
+                <span>Gap after words</span>
+                <select id="studyWordsGap" onchange="updateSettings()">
                     <option value="3">3</option>
                     <option value="6" selected>6</option>
                     <option value="10">10</option>
