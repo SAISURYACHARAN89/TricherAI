@@ -257,6 +257,7 @@ const magicWords = [
 let appSettings = {
   allowQuestionRepeat: false,
   autoPause: false,
+  contextMode: false,
   pauseGap: 5,
   wordsGap: 6,
   talkingSpeed: 1.0
@@ -270,6 +271,7 @@ function loadSettings() {
 
   document.getElementById("allowQuestionRepeat").checked = appSettings.allowQuestionRepeat;
   document.getElementById("autoPause").checked = appSettings.autoPause;
+  document.getElementById("contextMode").checked = appSettings.contextMode ?? false;
   document.getElementById("pauseGap").value = appSettings.pauseGap;
   document.getElementById("wordsGap").value = appSettings.wordsGap;
   document.getElementById("speedRange").value = appSettings.talkingSpeed;
@@ -282,6 +284,7 @@ function loadSettings() {
 function updateSettings() {
   appSettings.allowQuestionRepeat = document.getElementById("allowQuestionRepeat").checked;
   appSettings.autoPause = document.getElementById("autoPause").checked;
+  appSettings.contextMode = document.getElementById("contextMode").checked;
   appSettings.pauseGap = +document.getElementById("pauseGap").value;
   appSettings.wordsGap = +document.getElementById("wordsGap").value;
   appSettings.talkingSpeed = +document.getElementById("speedRange").value;

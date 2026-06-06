@@ -267,6 +267,11 @@ public class RagManager {
         return chunks;
     }
 
+    // Minimum composite score for a chunk to be considered relevant.
+    // USE gives lower cosine for question-vs-statement form; keyword overlap compensates.
+    // Completely unrelated queries score ~0.10–0.20; in-scope factual queries ~0.30–0.45.
+    private static final double RELEVANCE_THRESHOLD = 0.28;
+
     public String retrieve(String query, int topK) {
         if (!isReady()) return "";
 
@@ -285,16 +290,28 @@ public class RagManager {
                 double exactMatchBoost = containsImportantPhrase(chunk.normalizedText, queryTerms) ? 0.08 : 0.0;
                 double finalScore = similarity * 0.82 + keywordScore * 0.18 + exactMatchBoost;
 
-                // Log top similarities for debugging
-                if (finalScore > 0.45) {
-                    Log.d(TAG, "Retrieval match: " + finalScore + " - " + chunk.text.substring(0, Math.min(80, chunk.text.length())));
-                }
                 scoredChunks.add(new ScoredChunk(chunk, finalScore));
             }
 
             scoredChunks.sort((a, b) -> Double.compare(b.score, a.score));
 
-            List<ScoredChunk> selectedChunks = selectDiverseChunks(scoredChunks, topK);
+            double bestScore = scoredChunks.isEmpty() ? 0.0 : scoredChunks.get(0).score;
+            Log.i(TAG, "Best retrieval score: " + String.format("%.3f", bestScore) +
+                    " (threshold=" + RELEVANCE_THRESHOLD + ")");
+
+            // If the best chunk doesn't clear the relevance bar, the query is out-of-scope.
+            if (scoredChunks.isEmpty() || bestScore < RELEVANCE_THRESHOLD) {
+                Log.i(TAG, "No relevant chunks found — query is out of scope for the documents");
+                return "";
+            }
+
+            // Only keep chunks that are above the threshold.
+            List<ScoredChunk> relevant = new ArrayList<>();
+            for (ScoredChunk sc : scoredChunks) {
+                if (sc.score >= RELEVANCE_THRESHOLD) relevant.add(sc);
+            }
+
+            List<ScoredChunk> selectedChunks = selectDiverseChunks(relevant, topK);
             StringBuilder context = new StringBuilder();
             for (ScoredChunk scoredChunk : selectedChunks) {
                 if (context.length() > 0) {

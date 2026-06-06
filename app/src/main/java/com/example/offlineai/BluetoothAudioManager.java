@@ -178,9 +178,38 @@ public class BluetoothAudioManager {
             audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
             audioManager.setSpeakerphoneOn(false);
 
+            // 🔥 NEW: Normalize volume to prevent "Voice Call" mode from being too quiet
+            normalizeVolume();
+
             Log.i(TAG, "Switched to Bluetooth audio (Mode: " + audioManager.getMode() + ")");
         } catch (Exception e) {
             Log.e(TAG, "Error switching to Bluetooth audio", e);
+        }
+    }
+
+    /**
+     * Synchronizes STREAM_VOICE_CALL volume with STREAM_MUSIC volume.
+     * This prevents the volume drop often seen when entering MODE_IN_COMMUNICATION.
+     */
+    public void normalizeVolume() {
+        try {
+            int musicVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            int musicMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+            
+            // Calculate percentage of music volume
+            float percent = (float) musicVol / (musicMax > 0 ? musicMax : 1);
+
+            int voiceMax = audioManager.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL);
+            int targetVoiceVol = Math.round(percent * voiceMax);
+
+            // Ensure we don't mute it completely unless music is muted
+            if (musicVol > 0 && targetVoiceVol == 0) targetVoiceVol = 1;
+
+            audioManager.setStreamVolume(AudioManager.STREAM_VOICE_CALL, targetVoiceVol, 0);
+            Log.i(TAG, "Normalized Bluetooth volume: Music " + musicVol + "/" + musicMax + 
+                    " -> Voice " + targetVoiceVol + "/" + voiceMax);
+        } catch (Exception e) {
+            Log.e(TAG, "Error normalizing volume", e);
         }
     }
 

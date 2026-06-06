@@ -106,6 +106,7 @@
         // App Settings
         private boolean allowQuestionRepeat = false;
         private boolean autoPause = false;
+        private boolean contextModeEnabled = false;
         private int pauseGap = 5;
         private int wordsGap = 6;
         private String pendingUtteranceId = null;
@@ -323,12 +324,15 @@
 
                 // Add beep after question is asked
                 ui.postDelayed(() -> {
+                    if (!studyModeActive) return;
                     beepSingle(); // 🎯 ADD THIS BEEP
 
                     ui.postDelayed(() -> {
+                        if (!studyModeActive) return;
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
+                                if (!studyModeActive) return;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Segment response received: " + response);
 
@@ -336,6 +340,7 @@
                                 MainActivity.this.beepDouble();
 
                                 ui.post(() -> {
+                                    if (!studyModeActive) return;
                                     boolean wantsToStudy = response.contains("yes") || response.contains("yeah") ||
                                             response.contains("sure") || response.contains("okay");
 
@@ -361,8 +366,8 @@
                                 });
                             }
                         });
-                    }, 300);
-                }, 500); // Wait after the question
+                    }, 100);
+                }, 100); // Wait after the question
             }
 
             private void listenForNoteResponse(StudySegment segment, StudyNote note) {
@@ -370,12 +375,15 @@
 
                 // Add beep after question is asked
                 ui.postDelayed(() -> {
+                    if (!studyModeActive) return;
                     beepSingle(); // 🎯 ADD THIS BEEP
 
                     ui.postDelayed(() -> {
+                        if (!studyModeActive) return;
                         MainActivity.this.listenForCommand(STUDY_MODE_WAIT_SECONDS * 1000, new MainActivity.CommandCallback() {
                             @Override
                             public void onResult(String result) {
+                                if (!studyModeActive) return;
                                 String response = result.toLowerCase().trim();
                                 Log.i(TAG, "Note response received: " + response);
 
@@ -396,8 +404,8 @@
                                 }
                             }
                         });
-                    }, 300);
-                }, 500);
+                    }, 100);
+                }, 100);
             }
         }
 
@@ -885,10 +893,12 @@
                         // 🔥 FIX: Don't speak - just go back silently
                         Log.i(TAG, "✅ Study mode GOING BACK");
 
-                        ui.postDelayed(() ->
-                                studyModeSession.startNoteSelection(
-                                        studyModeSession.segments.get(studyModeSession.currentSegmentIndex)
-                                ), 300);
+                        ui.postDelayed(() -> {
+                            if (!studyModeActive) return;
+                            studyModeSession.startNoteSelection(
+                                    studyModeSession.segments.get(studyModeSession.currentSegmentIndex)
+                            );
+                        }, 300);
                     }
                 }
                 return;
@@ -1012,6 +1022,16 @@
             licenseManager.setCallback(this);
 
             ragManager = new RagManager();
+            // Auto-init RAG on startup if the embedding model is already downloaded.
+            // Without this, isReady() returns false after app restart even though
+            // the model file and all document embeddings are already on disk.
+            new Thread(() -> {
+                File embeddingModel = new File(getExternalFilesDir(null), "universal_sentence_encoder.tflite");
+                if (embeddingModel.exists() && embeddingModel.length() > 1000000) {
+                    Log.i(TAG, "Embedding model found on disk — auto-initializing RagManager");
+                    ragManager.init(MainActivity.this);
+                }
+            }).start();
             setupWebView();
             setupTTS();
             if (permissionManager.checkAndRequestPermissions()) {
@@ -1540,11 +1560,12 @@
                     JSONObject obj = new JSONObject(json);
                     allowQuestionRepeat = obj.optBoolean("allowQuestionRepeat", false);
                     autoPause = obj.optBoolean("autoPause", false);
+                    contextModeEnabled = obj.optBoolean("contextMode", false);
                     pauseGap = obj.optInt("pauseGap", 5);
                     wordsGap = obj.optInt("wordsGap", 6);
                     speechRate = (float) obj.optDouble("talkingSpeed", 1.0);
                     ui.post(() -> { if (tts != null) tts.setSpeechRate(speechRate); });
-                    Log.i(TAG, "Settings updated: AutoPause=" + autoPause);
+                    Log.i(TAG, "Settings updated: AutoPause=" + autoPause + ", ContextMode=" + contextModeEnabled);
                 } catch (Exception e) { Log.e(TAG, "Settings update fail", e); }
             }
 
@@ -2002,7 +2023,7 @@
                             confirmationHandled[0] = true;
                             Log.i(TAG, "Confirmation finished, setting up to listen for response");
 
-                            ui.post(() -> {
+                            ui.postDelayed(() -> {
                                 // Beep to indicate we're now listening for response
                                 beepSingle();
 
@@ -2031,10 +2052,10 @@
                                                 setupMainTTSListener();
                                                 WakeWordService.resumeWakeMode(MainActivity.this);
                                             }
-                                        }, 300);
+                                        }, 100);
                                     });
                                 });
-                            });
+                            }, 100);
                         }
                     }
 
@@ -2045,6 +2066,9 @@
                         setupMainTTSListener();
                     }
                 });
+
+                // Request audio focus and normalize volume
+                requestTtsAudioFocus();
 
                 // Now speak the confirmation
                 int result = tts.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "conf");
@@ -2167,10 +2191,11 @@
                                 currentChunkIndex + " of " + responseChunks.size());
 
                         if (currentChunkIndex >= responseChunks.size()) {
-                            Log.i(TAG, "Finished all normal mode chunks");
+                            Log.i(TAG, "Finished all normal mode chunks, speaking end notification");
                             ui.postDelayed(() -> {
-                                beepSingle();
-                                startSTTFromWake();
+                                if (!ttsSpeaking) {
+                                    tts.speak("Answer ended.", TextToSpeech.QUEUE_FLUSH, null, "end_msg");
+                                }
                             }, 500);
                             return;
                         }
@@ -2179,15 +2204,14 @@
                         return;
                     }
 
-                    // 🔥 Continuous flow for normal single-chunk speech
-                    if (id.equals("utt") && !studyModeActive) {
+                    // 🔥 NEW: Handle single-chunk normal response completion
+                    if (id.equals("utt") && !studyModeActive && inConversation) {
+                        Log.i(TAG, "AI finished speaking (utt), speaking end notification");
                         ui.postDelayed(() -> {
                             if (!ttsSpeaking) {
-                                Log.i(TAG, "AI finished speaking (utt), waiting for user response...");
-                                beepSingle();
-                                startSTTFromWake();
+                                tts.speak("Answer ended.", TextToSpeech.QUEUE_FLUSH, null, "end_msg");
                             }
-                        }, 500);
+                        }, 300);
                         return;
                     }
 
@@ -2216,8 +2240,9 @@
                         return;
                     }
 
-                    // Final cleanup
-                    if (!studyModeActive && !ttsSpeaking && !id.startsWith("chunk_") && !id.equals("utt") && !id.equals("study_exit_msg")) {
+                    // Final cleanup - triggers after end_msg or other non-excluded utterances
+                    if (!studyModeActive && !ttsSpeaking && !id.startsWith("chunk_") && !id.equals("conf") && !id.equals("repeat") && !id.equals("utt")) {
+                        Log.i(TAG, "Final cleanup for utterance: " + id);
                         ui.postDelayed(() -> {
                             if (!ttsSpeaking) {
                                 inConversation = false;
@@ -2252,6 +2277,8 @@
             // Maintain IN_COMMUNICATION during conversation to prevent Bluetooth SCO flapping
             if (bluetoothAudioManager != null && bluetoothAudioManager.isBluetoothHeadsetConnected()) {
                 am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                // 🔥 NEW: Ensure voice stream matches music stream loudness
+                bluetoothAudioManager.normalizeVolume();
             } else {
                 am.setMode(AudioManager.MODE_NORMAL);
             }
@@ -2328,6 +2355,9 @@
         resetStudyModeTimeout();
 
         if (currentChunkIndex < responseChunks.size()) {
+                // 🔥 Request audio focus and normalize volume before speaking
+                requestTtsAudioFocus();
+
                 String text = responseChunks.get(currentChunkIndex);
                 String utteranceId = "study_content_" + noteId + "_chunk_" + currentChunkIndex;
 
@@ -2478,6 +2508,7 @@
                 resetStudyModeTimeout(); // Reset timeout on each interaction
 
                 ui.postDelayed(() -> {
+                    if (!studyModeActive) return;
                     switch (callbackType) {
                         case "start":
                             Log.i(TAG, "Starting first segment after start message");
@@ -2540,20 +2571,19 @@
                         processedQuestion = question;
                     }
 
-                    // Use RAG if context available
+                    // Use RAG only when Context Mode is enabled
                     String directDocumentAnswer = "";
                     String contextText = "";
-                    if (ragManager != null && ragManager.isReady()) {
+                    if (contextModeEnabled && ragManager != null && ragManager.isReady()) {
                         directDocumentAnswer = ragManager.answerFromDocuments(processedQuestion);
                         contextText = ragManager.retrieve(processedQuestion, 5);
                         if (contextText != null) {
-                            // Keep useful structure while trimming to fit the small local model window.
                             contextText = contextText.trim();
                             if (contextText.length() > 1200) {
                                 contextText = contextText.substring(0, 1200) + "...";
                             }
                         }
-                        Log.i(TAG, "RAG Context retrieved (length: " + contextText.length() + ")");
+                        Log.i(TAG, "RAG Context retrieved (length: " + (contextText != null ? contextText.length() : 0) + ")");
                     }
 
                     if (directDocumentAnswer != null && !directDocumentAnswer.isEmpty()) {
@@ -2563,14 +2593,25 @@
                         return;
                     }
 
-                    // Compact prompt so the model sees more real document content.
+                    // When Context Mode is on but no relevant content was found, do NOT call
+                    // the LLM — it would hallucinate an answer unrelated to the documents.
+                    if (contextModeEnabled && (contextText == null || contextText.isEmpty())) {
+                        Log.i(TAG, "Context Mode on but no relevant content found — declining to answer");
+                        beepSingle();
+                        processAndSpeakResponse(
+                                "The information you're asking about is not available in the provided documents.");
+                        return;
+                    }
+
                     String prompt;
                     if (contextText != null && !contextText.isEmpty()) {
-                        prompt = "Use only the document context below to answer the question. " +
-                                "If the answer is not in the document, say that clearly.\n\n" +
+                        prompt = "Answer the question using ONLY the document context provided below. " +
+                                "Do not add any information that is not explicitly stated in the context. " +
+                                "If the context does not contain enough information to answer, say exactly: " +
+                                "\"The answer is not available in the provided documents.\"\n\n" +
                                 "Document context:\n" + contextText +
                                 "\n\nQuestion: " + processedQuestion +
-                                "\nAnswer briefly and factually.";
+                                "\nAnswer strictly from the context above.";
                     } else {
                         prompt = "Question: " + processedQuestion + "\nAnswer briefly and factually.";
                     }
@@ -3335,10 +3376,8 @@
         private void speak(String txt) {
             Log.i(TAG, "speak called: " + (txt.length() > 50 ? txt.substring(0, 50) + "..." : txt));
 
-            // Set correct audio mode based on Bluetooth state
-            if (bluetoothAudioManager != null) {
-                bluetoothAudioManager.setAudioModeForTTS();
-            }
+            // Request audio focus and set correct audio mode based on Bluetooth state
+            requestTtsAudioFocus();
 
             if (tts != null && ttsReady) {
                 // Ensure we use the correct utterance ID for normal speech
